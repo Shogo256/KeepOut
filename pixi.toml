@@ -1,17 +1,13 @@
 [workspace]
-authors = ["Escoffier1156 <escoffier.office1156@gmail.com>"]
+name = "keepout"
+version = "1.0.0"
+description = "Lightweight code protection CLI powered by Smart Syntax Locking and Property-Based Testing."
+authors = ["Escoffier1156"]
 channels = ["conda-forge"]
-name = "KeepOut"
 platforms = ["linux-64"]
-version = "0.1.0"
-
-[tasks]
 
 [dependencies]
 python = "3.11.*"
-z3-solver = ">=4.16.0.0,<5"
-click = ">=8.4.2,<9"
-pytest = ">=9.1.1,<10"
-pip = ">=26.2,<27"
-clang = ">=22.1.8,<23"
-llvm = ">=22.1.8,<23"
+click = ">=8.0.0"
+pytest = ">=8.0.0"
+pip = "*"

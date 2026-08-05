@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepout"
-version = "0.1.0"
-description = "A lightweight CLI tool to physically lock code logic using formal verification."
+version = "1.0.0"
+description = "Lightweight code protection CLI powered by Smart Syntax Locking and Property-Based Testing."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "z3-solver>=4.12.0",
     "click>=8.0.0",
 ]
 

@@ -1,4 +1,4 @@
-"""Core module for KeepOut: Smart Syntax Locking (AST Alpha-Renaming) & Smart Property-Based Testing (PBT)."""
+"""Core module for KeepOut: Smart Syntax Locking (AST Alpha-Renaming) & Property-Based Testing (PBT)."""
 
 import ast
 from dataclasses import dataclass
@@ -8,8 +8,6 @@ import os
 from pathlib import Path
 import random
 import re
-import subprocess
-import tempfile
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 
@@ -139,7 +137,7 @@ def parse_file_locks(file_path: Path) -> List[LockBlock]:
 # =====================================================================
 
 DEFAULT_DB_NAME = "keepout.json"
-VERSION = "5.0.0"  # Smart Syntax Lock (AST Alpha-Rename) & Smart PBT Sub-Engine
+VERSION = "1.0.0"
 
 
 def compute_strict_hash(content: str) -> str:
