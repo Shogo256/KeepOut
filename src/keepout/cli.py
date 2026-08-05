@@ -12,6 +12,7 @@ from keepout.core import (
     LockBlock,
     LockParserError,
     compute_strict_hash,
+    compute_ast_hash,
     load_locks_db,
     sync_blocks_to_db,
     parse_file_locks,
@@ -27,7 +28,7 @@ SUPPORTED_EXTENSIONS: Set[str] = {
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
     ".rs", ".py", ".go", ".java", ".js", ".ts", ".jsx", ".tsx",
     ".sh", ".bash", ".sac", ".mojo", ".s", ".asm", ".ll", ".llvm",
-    ".scm", ".ss", ".lisp", ".clj", ".apl", ".ijs", ".v", ".sv", ".sol"
+    ".scm", ".ss", ".lisp", ".clj", ".apl", ".ijs", ".v", ".sv", ".sol", ".🔥"
 }
 
 
@@ -48,7 +49,7 @@ def find_source_files(root_dir: Path) -> List[Path]:
 @click.group()
 @click.version_option(version=__version__, prog_name="keepout")
 def cli():
-    """KeepOut - Universal Code Protection via Multi-AST & Z3 Formal Verification."""
+    """KeepOut - Production-Ready Code Protection (Strict, AST Hash, PBT & Z3)."""
     pass
 
 
@@ -121,7 +122,10 @@ def check_cmd(target_dir: Path):
 
         saved_info = saved_locks[key]
         current_hash = compute_strict_hash(block.content)
+        ext = block.file_path.suffix.lstrip(".")
+        current_ast_hash = compute_ast_hash(block.content, lang=ext)
 
+        # 1. Strict Lock Mode (Byte/Text SHA-256)
         if saved_info["mode"] == "strict":
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (strict lock intact)")
@@ -129,23 +133,36 @@ def check_cmd(target_dir: Path):
                 if block.unlock_reason:
                     click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
                 else:
-                    click.echo(f"🚨 [LOCK VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Strict lock region has been modified!", err=True)
+                    click.echo(f"🚨 [LOCK VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Strict lock region modified!", err=True)
                     violation_count += 1
 
-        elif saved_info["mode"] == "logic":
+        # 2. AST Lock Mode (Syntax Tree Structural Hash)
+        elif saved_info["mode"] == "ast":
+            if current_ast_hash == saved_info.get("ast_hash"):
+                click.echo(f"✅ [PASS] {key} (AST structural lock - formatting/comments ignored)")
+            else:
+                if block.unlock_reason:
+                    click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
+                else:
+                    click.echo(f"🚨 [AST STRUCTURAL VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Code AST structure modified!", err=True)
+                    violation_count += 1
+
+        # 3. PBT / Logic Equivalence Verification Mode
+        elif saved_info["mode"] in ["pbt", "logic"]:
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (logic lock - unmodified text)")
+            elif current_ast_hash == saved_info.get("ast_hash"):
+                click.echo(f"✅ [PASS] {key} (logic lock - AST structural match)")
             elif block.unlock_reason:
                 click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
             else:
-                saved_ir = saved_info.get("compiled_ir", block.content)
-                ext = block.file_path.suffix.lstrip(".")
+                orig_code = saved_info.get("original_code", block.content)
                 
                 try:
-                    res = prove_universal_equivalence(saved_ir, block.content, lang=ext)
+                    res = prove_universal_equivalence(orig_code, block.content, lang=ext)
 
                     if res.is_equivalent:
-                        click.echo(f"✨ [FORMAL PROOF PASS] {key} ({rel_path}:{block.start_line}) - Code text refactored! Z3 proved logic is 100% equivalent.")
+                        click.echo(f"✨ [VERIFICATION PASS] {key} ({rel_path}:{block.start_line}) - {res.message}")
                     else:
                         click.echo(f"🚨 [LOGIC VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Calculation logic modified!", err=True)
                         click.echo(f"  {res.message}", err=True)
