@@ -17,7 +17,7 @@ from keepout.core import (
     sync_blocks_to_db,
     parse_file_locks,
     make_lock_key,
-    prove_universal_equivalence,
+    property_based_test_equivalence,
 )
 
 IGNORED_DIRS: Set[str] = {
@@ -49,7 +49,7 @@ def find_source_files(root_dir: Path) -> List[Path]:
 @click.group()
 @click.version_option(version=__version__, prog_name="keepout")
 def cli():
-    """KeepOut - Production-Ready Code Protection (Strict, AST Hash, PBT & Z3)."""
+    """KeepOut - Smart Syntax Locking & Property-Based Testing Sub-Engine."""
     pass
 
 
@@ -136,10 +136,10 @@ def check_cmd(target_dir: Path):
                     click.echo(f"🚨 [LOCK VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Strict lock region modified!", err=True)
                     violation_count += 1
 
-        # 2. AST Lock Mode (Syntax Tree Structural Hash)
-        elif saved_info["mode"] == "ast":
+        # 2. Smart Syntax Lock Mode (AST Structural & Variable Alpha-Rename Hash - Default)
+        elif saved_info["mode"] in ["ast", "default"]:
             if current_ast_hash == saved_info.get("ast_hash"):
-                click.echo(f"✅ [PASS] {key} (AST structural lock - formatting/comments ignored)")
+                click.echo(f"✅ [PASS] {key} (Smart Syntax Lock - formatting, comments & variable renames ignored)")
             else:
                 if block.unlock_reason:
                     click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
@@ -147,7 +147,7 @@ def check_cmd(target_dir: Path):
                     click.echo(f"🚨 [AST STRUCTURAL VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Code AST structure modified!", err=True)
                     violation_count += 1
 
-        # 3. PBT / Logic Equivalence Verification Mode
+        # 3. Property-Based Testing Sub-Engine (PBT / Logic Lock)
         elif saved_info["mode"] in ["pbt", "logic"]:
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (logic lock - unmodified text)")
@@ -159,17 +159,17 @@ def check_cmd(target_dir: Path):
                 orig_code = saved_info.get("original_code", block.content)
                 
                 try:
-                    res = prove_universal_equivalence(orig_code, block.content, lang=ext)
+                    res = property_based_test_equivalence(orig_code, block.content, lang=ext, num_samples=10000)
 
                     if res.is_equivalent:
-                        click.echo(f"✨ [VERIFICATION PASS] {key} ({rel_path}:{block.start_line}) - {res.message}")
+                        click.echo(f"✨ [PBT VERIFICATION PASS] {key} ({rel_path}:{block.start_line}) - {res.message}")
                     else:
                         click.echo(f"🚨 [LOGIC VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Calculation logic modified!", err=True)
                         click.echo(f"  {res.message}", err=True)
                         violation_count += 1
 
                 except Exception as err:
-                    click.echo(f"🚨 [SOLVER ERROR] {key} - Unable to perform logic verification: {err}", err=True)
+                    click.echo(f"🚨 [PBT ENGINE ERROR] {key} - Unable to perform property-based verification: {err}", err=True)
                     violation_count += 1
 
     for key, saved_info in saved_locks.items():
