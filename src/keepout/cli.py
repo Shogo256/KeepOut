@@ -16,8 +16,8 @@ from keepout.core import (
     sync_blocks_to_db,
     parse_file_locks,
     make_lock_key,
-    compile_snippet_to_asm,
-    prove_asm_equivalence,
+    compile_snippet_to_llvm_ir,
+    prove_llvm_ir_equivalence,
 )
 
 IGNORED_DIRS: Set[str] = {
@@ -27,7 +27,7 @@ IGNORED_DIRS: Set[str] = {
 SUPPORTED_EXTENSIONS: Set[str] = {
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
     ".rs", ".py", ".go", ".java", ".js", ".ts", ".jsx", ".tsx",
-    ".sh", ".bash", ".sac", ".mojo", ".s", ".asm"
+    ".sh", ".bash", ".sac", ".mojo", ".s", ".asm", ".ll", ".llvm"
 }
 
 
@@ -48,7 +48,7 @@ def find_source_files(root_dir: Path) -> List[Path]:
 @click.group()
 @click.version_option(version=__version__, prog_name="keepout")
 def cli():
-    """KeepOut - Physical & Logic-Semantic Code Lock Tool."""
+    """KeepOut - Cross-Platform Logic Protection via LLVM IR & Z3 Formal Verification."""
     pass
 
 
@@ -138,25 +138,25 @@ def check_cmd(target_dir: Path):
             elif block.unlock_reason:
                 click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
             else:
-                saved_asm = saved_info.get("compiled_asm")
+                saved_llvm_ir = saved_info.get("compiled_llvm_ir")
                 ext = block.file_path.suffix.lstrip(".")
                 
                 try:
-                    current_asm = compile_snippet_to_asm(block.content, lang=ext, symbol=block.target_symbol)
-                    if not saved_asm:
-                        saved_asm = current_asm
+                    current_llvm_ir = compile_snippet_to_llvm_ir(block.content, lang=ext, symbol=block.target_symbol)
+                    if not saved_llvm_ir:
+                        saved_llvm_ir = current_llvm_ir
 
-                    res = prove_asm_equivalence(saved_asm, current_asm)
+                    res = prove_llvm_ir_equivalence(saved_llvm_ir, current_llvm_ir)
 
                     if res.is_equivalent:
-                        click.echo(f"✨ [FORMAL PROOF PASS] {key} ({rel_path}:{block.start_line}) - Code text refactored! Z3 proved logic is 100% equivalent.")
+                        click.echo(f"✨ [FORMAL PROOF PASS] {key} ({rel_path}:{block.start_line}) - Code text refactored! Z3 proved LLVM IR logic is 100% equivalent.")
                     else:
                         click.echo(f"🚨 [LOGIC VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Calculation logic modified!", err=True)
                         click.echo(f"  {res.message}", err=True)
                         violation_count += 1
 
                 except Exception as err:
-                    click.echo(f"🚨 [COMPILER/SOLVER ERROR] {key} - Unable to perform logic verification: {err}", err=True)
+                    click.echo(f"🚨 [COMPILER/SOLVER ERROR] {key} - Unable to perform LLVM IR logic verification: {err}", err=True)
                     violation_count += 1
 
     for key, saved_info in saved_locks.items():

@@ -1,4 +1,4 @@
-"""Core module for KeepOut: Directive parsing, storage DB, assembly interpretation & Z3 formal verification."""
+"""Core module for KeepOut: Directive parsing, storage DB, LLVM IR parsing & Z3 formal verification."""
 
 from dataclasses import dataclass
 import hashlib
@@ -138,7 +138,7 @@ def parse_file_locks(file_path: Path) -> List[LockBlock]:
 # =====================================================================
 
 DEFAULT_DB_NAME = "keepout.json"
-VERSION = "1.0.0"
+VERSION = "2.0.0"  # Upgraded to LLVM IR architecture
 
 
 def compute_strict_hash(content: str) -> str:
@@ -187,20 +187,20 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
         key = make_lock_key(rel_path, block.lock_index)
         content_hash = compute_strict_hash(block.content)
 
-        compiled_asm = None
+        compiled_llvm_ir = None
         if block.mode == "logic":
             try:
                 ext = block.file_path.suffix.lstrip(".")
-                compiled_asm = compile_snippet_to_asm(block.content, lang=ext, symbol=block.target_symbol)
+                compiled_llvm_ir = compile_snippet_to_llvm_ir(block.content, lang=ext, symbol=block.target_symbol)
             except Exception:
-                compiled_asm = None
+                compiled_llvm_ir = None
 
         new_locks[key] = {
             "file_path": rel_path,
             "lock_index": block.lock_index,
             "mode": block.mode,
             "strict_hash": content_hash,
-            "compiled_asm": compiled_asm,
+            "compiled_llvm_ir": compiled_llvm_ir,
             "target_symbol": block.target_symbol,
             "start_line": block.start_line,
             "end_line": block.end_line,
@@ -213,45 +213,53 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
 
 
 # =====================================================================
-# 3. Compiler Backend Bridge (C / Rust -> x86_64 Assembly)
+# 3. LLVM IR Compiler Backend Bridge (Clang / Rustc -> LLVM IR .ll)
 # =====================================================================
 
 class CompilerError(Exception):
     pass
 
 
-def compile_snippet_to_asm(snippet: str, lang: str = "c", symbol: Optional[str] = None) -> str:
-    """Compiles code snippet into clean x86_64 assembly code."""
+def compile_snippet_to_llvm_ir(snippet: str, lang: str = "c", symbol: Optional[str] = None) -> str:
+    """Compiles code snippet into target-agnostic LLVM IR (.ll)."""
     lang = lang.lower().lstrip(".")
+    if lang in ["ll", "llvm"]:
+        return snippet
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
-        if lang in ["c", "h"]:
+        if lang in ["c", "h", "cpp", "cc", "cxx", "hpp"]:
             src_file = tmp_path / "code.c"
-            asm_file = tmp_path / "code.s"
+            ir_file = tmp_path / "code.ll"
             full_code = _wrap_c_code(snippet, symbol)
             src_file.write_text(full_code, encoding="utf-8")
 
-            cmd = ["gcc", "-S", "-O2", str(src_file), "-o", str(asm_file)]
+            # Run clang -S -emit-llvm -O2
+            cmd = ["clang", "-S", "-emit-llvm", "-O2", str(src_file), "-o", str(ir_file)]
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if res.returncode != 0:
-                raise CompilerError(f"GCC compilation failed:\n{res.stderr}")
-            return _clean_asm(asm_file.read_text(encoding="utf-8"))
+                # Fallback to gcc if clang is missing
+                cmd_gcc = ["gcc", "-S", "-emit-llvm", "-O2", str(src_file), "-o", str(ir_file)]
+                res_gcc = subprocess.run(cmd_gcc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if res_gcc.returncode != 0:
+                    raise CompilerError(f"LLVM IR compilation failed:\n{res.stderr}\n{res_gcc.stderr}")
+            return ir_file.read_text(encoding="utf-8")
 
         elif lang in ["rs", "rust"]:
             src_file = tmp_path / "code.rs"
-            asm_file = tmp_path / "code.s"
+            ir_file = tmp_path / "code.ll"
             full_code = _wrap_rust_code(snippet, symbol)
             src_file.write_text(full_code, encoding="utf-8")
 
-            cmd = ["rustc", "--emit", "asm", "-O", str(src_file), "-o", str(asm_file)]
+            cmd = ["rustc", "--emit=llvm-ir", "-O", str(src_file), "-o", str(ir_file)]
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if res.returncode != 0:
-                raise CompilerError(f"Rustc compilation failed:\n{res.stderr}")
-            return _clean_asm(asm_file.read_text(encoding="utf-8"))
+                raise CompilerError(f"Rustc LLVM IR compilation failed:\n{res.stderr}")
+            return ir_file.read_text(encoding="utf-8")
 
         else:
-            raise CompilerError(f"Unsupported language: '{lang}'")
+            raise CompilerError(f"Unsupported language for LLVM IR compilation: '{lang}'")
 
 
 def _wrap_c_code(snippet: str, symbol: Optional[str]) -> str:
@@ -268,164 +276,223 @@ def _wrap_rust_code(snippet: str, symbol: Optional[str]) -> str:
     return f"#![crate_type = \"lib\"]\n#[no_mangle]\npub extern \"C\" fn {func_name}(rdi: i64, rsi: i64, rdx: i64, rcx: i64) -> i64 {{\n{snippet}\n}}\n"
 
 
-def _clean_asm(raw_asm: str) -> str:
-    clean = []
-    for line in raw_asm.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(".") and not stripped.endswith(":"):
-            if not (stripped.startswith(".L") and ":" not in stripped):
+# =====================================================================
+# 4. LLVM IR Parser & Z3 Interpreter Engine
+# =====================================================================
+
+def parse_llvm_type_width(type_str: str) -> int:
+    """Parses LLVM IR bit width, e.g. i32 -> 32, i64 -> 64, i1 -> 1, i8 -> 8."""
+    type_str = type_str.strip()
+    if type_str.startswith("i") and type_str[1:].isdigit():
+        return int(type_str[1:])
+    return 32  # Default bit width
+
+
+class LlvmIrInterpreter:
+    """Parses LLVM IR SSA lines and translates expressions into Z3 BitVectors."""
+
+    def __init__(self, shared_inputs: Optional[Dict[str, z3.ExprRef]] = None):
+        self.env: Dict[str, z3.ExprRef] = {}
+        self.shared_inputs = shared_inputs if shared_inputs is not None else {}
+
+    def get_val(self, operand_str: str, default_width: int = 32) -> z3.ExprRef:
+        """Resolves an operand string (SSA variable %val or constant int) to a Z3 BitVector."""
+        operand_str = operand_str.strip()
+        if operand_str in self.env:
+            return self.env[operand_str]
+        
+        # Immediate constant integer
+        if operand_str.lstrip("-").isdigit():
+            val = int(operand_str)
+            return z3.BitVecVal(val, default_width)
+        
+        # Boolean constant
+        if operand_str == "true":
+            return z3.BitVecVal(1, 1)
+        if operand_str == "false":
+            return z3.BitVecVal(0, 1)
+
+        # Free input variable fallback
+        var_name = f"VAR_{operand_str.lstrip('%')}"
+        bv = z3.BitVec(var_name, default_width)
+        self.env[operand_str] = bv
+        return bv
+
+    def execute_llvm_ir(self, llvm_ir: str) -> z3.ExprRef:
+        """Parses an LLVM IR module and returns the final return expression."""
+        lines = llvm_ir.splitlines()
+        
+        # First pass: find target function definition and initialize parameter SSA variables
+        in_func = False
+        ret_expr: Optional[z3.ExprRef] = None
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
                 continue
-        if stripped.startswith("#") or stripped.startswith(";") or not stripped:
-            continue
-        clean.append(line)
-    return "\n".join(clean)
+
+            # Function header e.g. define i32 @calc(i32 %0, i32 %1)
+            if stripped.startswith("define "):
+                in_func = True
+                param_match = re.search(r'define\s+.*?\s*@\w+\((?P<args>[^)]*)\)', stripped)
+                if param_match:
+                    args_str = param_match.group("args")
+                    if args_str.strip():
+                        args = [a.strip() for a in args_str.split(",") if a.strip()]
+                        for arg_idx, arg in enumerate(args):
+                            parts = arg.split()
+                            type_w = parse_llvm_type_width(parts[0]) if parts else 32
+                            var_name = parts[-1] if len(parts) > 1 else f"%{arg_idx}"
+                            
+                            if var_name in self.shared_inputs:
+                                self.env[var_name] = self.shared_inputs[var_name]
+                            else:
+                                free_bv = z3.BitVec(f"ARG{arg_idx}_{var_name.lstrip('%')}", type_w)
+                                self.env[var_name] = free_bv
+                                self.shared_inputs[var_name] = free_bv
+                continue
+
+            if not in_func:
+                continue
+
+            if stripped == "}":
+                in_func = False
+                continue
+
+            # Parse instructions inside function
+            res = self._execute_instruction(stripped)
+            if res is not None:
+                ret_expr = res
+
+        if ret_expr is None:
+            raise ValueError("No return instruction found in LLVM IR code block.")
+        return ret_expr
+
+    def _execute_instruction(self, line: str) -> Optional[z3.ExprRef]:
+        # Return instruction e.g. ret i32 %2 or ret i64 42
+        if line.startswith("ret "):
+            parts = line.split()
+            width = parse_llvm_type_width(parts[1]) if len(parts) > 1 else 32
+            val_str = parts[2] if len(parts) > 2 else parts[1]
+            return self.get_val(val_str, default_width=width)
+
+        # Assignment instruction e.g. %2 = shl nsw i32 %0, 2
+        if "=" not in line:
+            return None
+
+        lhs, rhs = line.split("=", 1)
+        dst_var = lhs.strip()
+        rhs_tokens = rhs.strip().split()
+
+        if not rhs_tokens:
+            return None
+
+        opcode = rhs_tokens[0].lower()
+        # Handle qualifiers like nsw, nuw e.g. shl nsw i32 %0, 2
+        idx = 0
+        while idx < len(rhs_tokens) and rhs_tokens[idx] in ["nsw", "nuw", "exact", "dso_local"]:
+            idx += 1
+        
+        opcode = rhs_tokens[idx].lower()
+        args_tokens = rhs_tokens[idx+1:]
+
+        # Binary ops: add, sub, mul, sdiv, udiv, srem, urem, shl, ashr, lshr, and, or, xor
+        if opcode in ["add", "sub", "mul", "sdiv", "udiv", "srem", "urem", "shl", "ashr", "lshr", "and", "or", "xor"]:
+            # Pattern: type %val1, %val2
+            rest_str = " ".join(args_tokens)
+            parts = [p.strip() for p in rest_str.split(",")]
+            type_str = parts[0].split()[0]
+            w = parse_llvm_type_width(type_str)
+
+            v1_str = parts[0].split()[-1]
+            v2_str = parts[1] if len(parts) > 1 else "0"
+
+            val1 = self.get_val(v1_str, default_width=w)
+            val2 = self.get_val(v2_str, default_width=w)
+
+            # Adjust bit widths if mismatch
+            if val1.size() != val2.size():
+                target_w = max(val1.size(), val2.size())
+                if val1.size() < target_w: val1 = z3.ZeroExt(target_w - val1.size(), val1)
+                if val2.size() < target_w: val2 = z3.ZeroExt(target_w - val2.size(), val2)
+
+            if opcode == "add": self.env[dst_var] = val1 + val2
+            elif opcode == "sub": self.env[dst_var] = val1 - val2
+            elif opcode == "mul": self.env[dst_var] = val1 * val2
+            elif opcode == "sdiv": self.env[dst_var] = val1 / val2
+            elif opcode == "udiv": self.env[dst_var] = z3.UDiv(val1, val2)
+            elif opcode == "srem": self.env[dst_var] = val1 % val2
+            elif opcode == "urem": self.env[dst_var] = z3.URem(val1, val2)
+            elif opcode == "shl": self.env[dst_var] = val1 << val2
+            elif opcode == "ashr": self.env[dst_var] = val1 >> val2
+            elif opcode == "lshr": self.env[dst_var] = z3.LShR(val1, val2)
+            elif opcode == "and": self.env[dst_var] = val1 & val2
+            elif opcode == "or": self.env[dst_var] = val1 | val2
+            elif opcode == "xor": self.env[dst_var] = val1 ^ val2
+
+        # ICMP instruction e.g. %res = icmp eq i32 %a, %b
+        elif opcode == "icmp":
+            cond_kind = args_tokens[0]
+            rest_str = " ".join(args_tokens[1:])
+            parts = [p.strip() for p in rest_str.split(",")]
+            type_str = parts[0].split()[0]
+            w = parse_llvm_type_width(type_str)
+
+            v1_str = parts[0].split()[-1]
+            v2_str = parts[1] if len(parts) > 1 else "0"
+
+            val1 = self.get_val(v1_str, default_width=w)
+            val2 = self.get_val(v2_str, default_width=w)
+
+            cond_expr = None
+            if cond_kind == "eq": cond_expr = (val1 == val2)
+            elif cond_kind == "ne": cond_expr = (val1 != val2)
+            elif cond_kind in ["slt", "ult"]: cond_expr = (val1 < val2)
+            elif cond_kind in ["sle", "ule"]: cond_expr = (val1 <= val2)
+            elif cond_kind in ["sgt", "ugt"]: cond_expr = (val1 > val2)
+            elif cond_kind in ["sge", "uge"]: cond_expr = (val1 >= val2)
+
+            if cond_expr is not None:
+                self.env[dst_var] = z3.If(cond_expr, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+
+        # SELECT instruction e.g. %res = select i1 %cond, i32 %v1, i32 %v2
+        elif opcode == "select":
+            rest_str = " ".join(args_tokens)
+            parts = [p.strip() for p in rest_str.split(",")]
+            cond_str = parts[0].split()[-1]
+            v1_str = parts[1].split()[-1]
+            v2_str = parts[2].split()[-1]
+            type_str = parts[1].split()[0]
+            w = parse_llvm_type_width(type_str)
+
+            cond_val = self.get_val(cond_str, default_width=1)
+            v1_val = self.get_val(v1_str, default_width=w)
+            v2_val = self.get_val(v2_str, default_width=w)
+
+            self.env[dst_var] = z3.If(cond_val == 1, v1_val, v2_val)
+
+        # Cast ops: sext, zext, trunc
+        elif opcode in ["sext", "zext", "trunc"]:
+            rest_str = " ".join(args_tokens)
+            # Pattern: i32 %x to i64
+            match_cast = re.search(r'(?P<t1>i\d+)\s+(?P<v>[^\s]+)\s+to\s+(?P<t2>i\d+)', rest_str)
+            if match_cast:
+                t1, v_str, t2 = match_cast.group("t1"), match_cast.group("v"), match_cast.group("t2")
+                w1, w2 = parse_llvm_type_width(t1), parse_llvm_type_width(t2)
+                v = self.get_val(v_str, default_width=w1)
+
+                if opcode == "sext":
+                    self.env[dst_var] = z3.SignExt(w2 - w1, v) if w2 > w1 else v
+                elif opcode == "zext":
+                    self.env[dst_var] = z3.ZeroExt(w2 - w1, v) if w2 > w1 else v
+                elif opcode == "trunc":
+                    self.env[dst_var] = z3.Extract(w2 - 1, 0, v) if w2 < w1 else v
+
+        return None
 
 
 # =====================================================================
-# 4. Z3 Register State & Assembly Interpreter Engine
-# =====================================================================
-
-REGISTER_NAMES_64 = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
-ARG_REGISTERS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-
-LEA_ATT_PATTERN = re.compile(r'^(?P<disp>-?\d+)?\((?:%(?P<base>[a-z0-9]+))?(?:,\s*%(?P<index>[a-z0-9]+)(?:,\s*(?P<scale>\d+))?)?\)$')
-LEA_INTEL_PATTERN = re.compile(r'^\[\s*(?:(?P<base>[a-z0-9]+)\s*)?(?:\+\s*(?P<index>[a-z0-9]+)\s*\*\s*(?P<scale>\d+)\s*)?(?:\+\s*(?P<disp>-?\d+)\s*)?\]$')
-
-
-class RegisterState:
-    """Manages Z3 BitVector expressions for 64-bit CPU registers."""
-    def __init__(self, init_free_inputs: bool = True):
-        self.regs: Dict[str, z3.ExprRef] = {}
-        for name in REGISTER_NAMES_64:
-            if init_free_inputs and name in ARG_REGISTERS:
-                idx = ARG_REGISTERS.index(name)
-                self.regs[name] = z3.BitVec(f"ARG{idx}_{name.upper()}", 64)
-            else:
-                self.regs[name] = z3.BitVecVal(0, 64)
-
-    def get_reg64(self, name: str) -> z3.ExprRef:
-        canonical = name.lower().lstrip("%")
-        if canonical in self.regs:
-            return self.regs[canonical]
-        if canonical.startswith("e") and canonical[1:] in ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]:
-            return z3.Extract(31, 0, self.regs["r" + canonical[1:]])
-        if canonical in [f"r{i}d" for i in range(8, 16)]:
-            return z3.Extract(31, 0, self.regs[canonical[:-1]])
-        if canonical in ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]:
-            return z3.Extract(15, 0, self.regs["r" + canonical])
-        if canonical in ["al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl"]:
-            base = canonical[:-1] if canonical.endswith("l") else canonical
-            parent = "r" + base
-            if parent not in self.regs: parent = "r" + canonical[0] + "x"
-            return z3.Extract(7, 0, self.regs[parent])
-        raise ValueError(f"Unknown register: '{name}'")
-
-    def set_reg64(self, name: str, val: z3.ExprRef) -> None:
-        canonical = name.lower().lstrip("%")
-        if val.size() != 64:
-            val = z3.ZeroExt(64 - val.size(), val) if val.size() < 64 else z3.Extract(63, 0, val)
-        if canonical in self.regs:
-            self.regs[canonical] = val
-            return
-        if canonical.startswith("e") and canonical[1:] in ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]:
-            self.regs["r" + canonical[1:]] = z3.ZeroExt(32, z3.Extract(31, 0, val))
-            return
-        if canonical in [f"r{i}d" for i in range(8, 16)]:
-            self.regs[canonical[:-1]] = z3.ZeroExt(32, z3.Extract(31, 0, val))
-            return
-        raise ValueError(f"Write to unknown register: '{name}'")
-
-
-class AsmInterpreter:
-    """Parses x86_64 assembly code and interprets state transitions into Z3 BitVectors."""
-    def __init__(self, state: Optional[RegisterState] = None):
-        self.state = state if state is not None else RegisterState()
-
-    def parse_operand(self, op_str: str) -> z3.ExprRef:
-        op_str = op_str.strip()
-        if op_str.startswith("$"):
-            return z3.BitVecVal(int(op_str[1:]), 64)
-        if op_str.lstrip("-").isdigit():
-            return z3.BitVecVal(int(op_str), 64)
-
-        att_match = LEA_ATT_PATTERN.match(op_str)
-        if att_match:
-            d, b, i, s = att_match.group("disp"), att_match.group("base"), att_match.group("index"), att_match.group("scale")
-            expr = z3.BitVecVal(0, 64)
-            if b: expr = expr + self.state.get_reg64(b)
-            if i: expr = expr + (self.state.get_reg64(i) * z3.BitVecVal(int(s) if s else 1, 64))
-            if d: expr = expr + z3.BitVecVal(int(d), 64)
-            return expr
-
-        intel_match = LEA_INTEL_PATTERN.match(op_str)
-        if intel_match:
-            b, i, s, d = intel_match.group("base"), intel_match.group("index"), intel_match.group("scale"), intel_match.group("disp")
-            expr = z3.BitVecVal(0, 64)
-            if b: expr = expr + self.state.get_reg64(b)
-            if i: expr = expr + (self.state.get_reg64(i) * z3.BitVecVal(int(s) if s else 1, 64))
-            if d: expr = expr + z3.BitVecVal(int(d), 64)
-            return expr
-
-        return self.state.get_reg64(op_str)
-
-    def execute_line(self, line: str) -> None:
-        line = line.split("#")[0].split(";")[0].strip()
-        if not line or line.endswith(":") or line.startswith("."):
-            return
-        parts = line.split(None, 1)
-        mnemonic = parts[0].lower()
-        operands = self._split_operands(parts[1] if len(parts) > 1 else "")
-
-        if mnemonic in ["ret", "retq"]: return
-
-        if mnemonic in ["mov", "movq", "movl", "movabsq"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[0]))
-        elif mnemonic in ["add", "addq", "addl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) + self.parse_operand(operands[0]))
-        elif mnemonic in ["sub", "subq", "subl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) - self.parse_operand(operands[0]))
-        elif mnemonic in ["imul", "imulq", "imull"]:
-            if len(operands) == 2:
-                self.state.set_reg64(operands[1], self.parse_operand(operands[1]) * self.parse_operand(operands[0]))
-            elif len(operands) == 3:
-                self.state.set_reg64(operands[2], self.parse_operand(operands[0]) * self.parse_operand(operands[1]))
-        elif mnemonic in ["sal", "shl", "salq", "shlq", "shll"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) << self.parse_operand(operands[0]))
-        elif mnemonic in ["sar", "sarq", "sarl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) >> self.parse_operand(operands[0]))
-        elif mnemonic in ["shr", "shrq", "shrl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], z3.LShR(self.parse_operand(operands[1]), self.parse_operand(operands[0])))
-        elif mnemonic in ["xor", "xorq", "xorl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) ^ self.parse_operand(operands[0]))
-        elif mnemonic in ["and", "andq", "andl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) & self.parse_operand(operands[0]))
-        elif mnemonic in ["or", "orq", "orl"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[1]) | self.parse_operand(operands[0]))
-        elif mnemonic in ["lea", "leaq", "leal"] and len(operands) == 2:
-            self.state.set_reg64(operands[1], self.parse_operand(operands[0]))
-        elif mnemonic in ["neg", "negq", "negl"] and len(operands) == 1:
-            self.state.set_reg64(operands[0], -self.parse_operand(operands[0]))
-        elif mnemonic in ["not", "notq", "notl"] and len(operands) == 1:
-            self.state.set_reg64(operands[0], ~self.parse_operand(operands[0]))
-
-    def execute_asm(self, asm_code: str) -> z3.ExprRef:
-        for line in asm_code.splitlines():
-            self.execute_line(line)
-        return self.state.get_reg64("rax")
-
-    def _split_operands(self, args_str: str) -> List[str]:
-        operands, current, depth = [], [], 0
-        for char in args_str:
-            if char in "([": depth += 1; current.append(char)
-            elif char in ")]": depth -= 1; current.append(char)
-            elif char == "," and depth == 0: operands.append("".join(current).strip()); current = []
-            else: current.append(char)
-        if current: operands.append("".join(current).strip())
-        return [op for op in operands if op]
-
-
-# =====================================================================
-# 5. Formally Proving Equivalence via Z3 Solver
+# 5. Formally Proving Equivalence via Z3 Solver on LLVM IR
 # =====================================================================
 
 @dataclass
@@ -436,31 +503,40 @@ class EquivalenceResult:
     counterexample: Optional[Dict[str, Any]] = None
 
 
-def prove_asm_equivalence(asm_a: str, asm_b: str) -> EquivalenceResult:
-    """Proves if assembly block A and block B produce identical RAX output for all inputs."""
-    state_a = RegisterState(init_free_inputs=True)
-    state_b = RegisterState(init_free_inputs=False)
-    for reg_name in ARG_REGISTERS:
-        state_b.set_reg64(reg_name, state_a.get_reg64(reg_name))
+def prove_llvm_ir_equivalence(llvm_ir_a: str, llvm_ir_b: str) -> EquivalenceResult:
+    """
+    Formally proves if LLVM IR module A and module B produce identical return expressions
+    for all possible input arguments, completely platform-agnostic (ARM64, x86_64, RISC-V).
+    """
+    shared_inputs: Dict[str, z3.ExprRef] = {}
 
-    rax_a = AsmInterpreter(state_a).execute_asm(asm_a)
-    rax_b = AsmInterpreter(state_b).execute_asm(asm_b)
+    interp_a = LlvmIrInterpreter(shared_inputs=shared_inputs)
+    interp_b = LlvmIrInterpreter(shared_inputs=shared_inputs)
+
+    out_a = interp_a.execute_llvm_ir(llvm_ir_a)
+    out_b = interp_b.execute_llvm_ir(llvm_ir_b)
+
+    # Adjust return expression widths if different (zero-extend)
+    if out_a.size() != out_b.size():
+        max_w = max(out_a.size(), out_b.size())
+        if out_a.size() < max_w: out_a = z3.ZeroExt(max_w - out_a.size(), out_a)
+        if out_b.size() < max_w: out_b = z3.ZeroExt(max_w - out_b.size(), out_b)
 
     solver = z3.Solver()
-    solver.add(rax_a != rax_b)
+    solver.add(out_a != out_b)
     check_res = solver.check()
 
     if check_res == z3.unsat:
         return EquivalenceResult(
             is_equivalent=True,
             status_str="unsat",
-            message="✨ Formally proven equivalent by Z3 solver (UNSAT: no counterexample exists)."
+            message="✨ Formally proven equivalent by Z3 solver on LLVM IR (UNSAT: cross-platform proof)."
         )
     elif check_res == z3.sat:
         model = solver.model()
         ce_inputs = {decl.name(): model[decl].as_long() for decl in model.decls()}
-        val_a = model.eval(rax_a, model_completion=True).as_long()
-        val_b = model.eval(rax_b, model_completion=True).as_long()
+        val_a = model.eval(out_a, model_completion=True).as_long()
+        val_b = model.eval(out_b, model_completion=True).as_long()
         return EquivalenceResult(
             is_equivalent=False,
             status_str="sat",

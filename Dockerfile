@@ -1,7 +1,9 @@
 FROM python:3.11-slim
 
-# Install GCC compiler and Git
+# Install Clang, LLVM compiler infrastructure and Git
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    llvm \
     gcc \
     git \
     && rm -rf /var/lib/apt/lists/*

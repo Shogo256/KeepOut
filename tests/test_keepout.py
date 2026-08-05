@@ -11,7 +11,7 @@ from keepout.core import (
     load_locks_db,
     save_locks_db,
     sync_blocks_to_db,
-    prove_asm_equivalence,
+    prove_llvm_ir_equivalence,
 )
 from keepout.cli import cli
 
@@ -119,32 +119,44 @@ def test_storage_lifecycle(tmp_path: Path):
 
 
 # =====================================================================
-# 3. Z3 Engine Verification Tests
+# 3. Z3 Engine Verification Tests on LLVM IR
 # =====================================================================
 
-def test_bitshift_vs_multiplication_equivalence():
-    asm_a = "movq %rdi, %rax\nimulq $4, %rax\nret"
-    asm_b = "movq %rdi, %rax\nsalq $2, %rax\nret"
-    res = prove_asm_equivalence(asm_a, asm_b)
+def test_llvm_ir_bitshift_vs_multiplication_equivalence():
+    ir_a = """
+    define i32 @calc(i32 %0) {
+        %2 = mul i32 %0, 4
+        ret i32 %2
+    }
+    """
+    ir_b = """
+    define i32 @calc(i32 %0) {
+        %2 = shl i32 %0, 2
+        ret i32 %2
+    }
+    """
+    res = prove_llvm_ir_equivalence(ir_a, ir_b)
     assert res.is_equivalent is True
     assert res.status_str == "unsat"
 
 
-def test_lea_vs_shift_add_equivalence():
-    asm_a = "leaq (%rdi,%rsi,4), %rax\nret"
-    asm_b = "movq %rsi, %rax\nshlq $2, %rax\naddq %rdi, %rax\nret"
-    res = prove_asm_equivalence(asm_a, asm_b)
-    assert res.is_equivalent is True
-    assert res.status_str == "unsat"
-
-
-def test_logic_mismatch_detected():
-    asm_a = "movq %rdi, %rax\nimulq $4, %rax\nret"
-    asm_b = "movq %rdi, %rax\nimulq $5, %rax\nret"
-    res = prove_asm_equivalence(asm_a, asm_b)
+def test_llvm_ir_logic_mismatch_detected():
+    ir_a = """
+    define i32 @calc(i32 %0) {
+        %2 = mul i32 %0, 4
+        ret i32 %2
+    }
+    """
+    ir_b = """
+    define i32 @calc(i32 %0) {
+        %2 = mul i32 %0, 5
+        ret i32 %2
+    }
+    """
+    res = prove_llvm_ir_equivalence(ir_a, ir_b)
     assert res.is_equivalent is False
     assert res.status_str == "sat"
-    assert "ARG0_RDI" in res.counterexample["inputs"]
+    assert "ARG0_0" in res.counterexample["inputs"] or "ARG0_0" in str(res.counterexample["inputs"])
 
 
 # =====================================================================
@@ -206,7 +218,7 @@ def test_e2e_logic_lock_refactoring_pass_and_violation(tmp_path: Path):
     runner = CliRunner()
     runner.invoke(cli, ["init", str(tmp_path)])
 
-    # Refactor code (PASS via Z3)
+    # Refactor code (PASS via LLVM IR + Z3)
     c_file.write_text(
         "// [LOCK: logic name=\"calc_val\"]\n"
         "int calc_val(int x) {\n"
@@ -220,7 +232,7 @@ def test_e2e_logic_lock_refactoring_pass_and_violation(tmp_path: Path):
     assert res1.exit_code == 0
     assert "FORMAL PROOF PASS" in res1.output
 
-    # Introduce bug (FAIL via Z3)
+    # Introduce bug (FAIL via LLVM IR + Z3)
     c_file.write_text(
         "// [LOCK: logic name=\"calc_val\"]\n"
         "int calc_val(int x) {\n"

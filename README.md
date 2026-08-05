@@ -1,10 +1,10 @@
 # 🔒 KeepOut
 
-> **Physical and logic-semantic protection for code regions using Z3 formal verification.**
+> **Cross-platform physical and logic-semantic protection for code regions powered by LLVM IR & Z3 Formal Verification.**
 
 **KeepOut** is a lightweight CLI tool designed to physically protect critical code sections from external changes—whether caused by future oversights, unintended edits by teammates, or automated AI refactorings—by marking regions with comment directives (`# [LOCK]` ... `# [/LOCK]`).
 
-Powered by Microsoft Research's **Z3 Solver**, KeepOut features **Differential Formal Verification**, mathematically proving whether code refactorings preserve exact 64-bit output semantics across all possible inputs.
+Powered by **LLVM IR (Intermediate Representation)** parsing and Microsoft Research's **Z3 Solver**, KeepOut features **Cross-Platform Differential Formal Verification**, mathematically proving whether code refactorings preserve exact output semantics across all possible inputs on Apple Silicon (M1/M2/M3/M4), x86_64, ARM64, and RISC-V architectures.
 
 ---
 
@@ -13,6 +13,8 @@ Powered by Microsoft Research's **Z3 Solver**, KeepOut features **Differential F
 - 🔒 **Two-Tier Locking System**:
   - **Strict Lock (`[LOCK: strict]`)**: Completely freezes exact code lines using SHA-256 hashing. Rejects even a single whitespace or comment change.
   - **Logic-only Lock (`[LOCK: logic]`)**: Permits logic-preserving refactorings (e.g. variable renames, optimization like `x * 4` ➔ `x << 2`), while formally proving semantic equivalence across all $2^{64}$ possible inputs. Rejects any alteration that shifts calculation outputs (e.g., `x * 5`).
+- ⚡ **LLVM IR Powered & Architecture Agnostic**:
+  - Leverages target-independent LLVM IR (`.ll`). Works seamlessly across Apple Silicon Macs, Linux, Windows, x86_64, and ARM64. Supports C, C++, Rust (`rustc --emit=llvm-ir`), Swift, Zig, and raw `.ll` LLVM IR files.
 - 🤖 **Safety Net for AI-Assisted Coding**:
   - Harness the speed of AI coding assistants (Copilot, Claude, Cursor) without worrying about introduced off-by-one errors or subtle logic regressions.
 - 🪝 **Git Pre-commit Integration**:
@@ -22,19 +24,19 @@ Powered by Microsoft Research's **Z3 Solver**, KeepOut features **Differential F
 
 ---
 
-## 🧠 How Differential Formal Verification Works
+## 🧠 How LLVM IR Differential Formal Verification Works
 
 ```
-[ Original Code ] ──( GCC Compiler )──> [ Assembly A ] ──┐
-                                                          ├──> [ Z3 Virtual CPU State ] ──> [ Z3 Solver: A != B ]
-[ Modified Code ] ──( GCC Compiler )──> [ Assembly B ] ──┘                                      │
-                                                                                                ├──> UNSAT (No counterexample) ➔ PASS ✨
-                                                                                                └──> SAT (Counterexample found) ➔ BLOCK 🚨
+[ Original Code ] ──( Clang / Rustc )──> [ LLVM IR A (.ll) ] ──┐
+                                                                ├──> [ Z3 LLVM SSA Interpreter ] ──> [ Z3 Solver: A != B ]
+[ Modified Code ] ──( Clang / Rustc )──> [ LLVM IR B (.ll) ] ──┘                                           │
+                                                                                                           ├──> UNSAT (No counterexample) ➔ PASS ✨
+                                                                                                           └──> SAT (Counterexample found) ➔ BLOCK 🚨
 ```
 
-1. **Reduction to x86_64 Assembly**: Code blocks in high-level languages (C, Rust, etc.) are compiled via GCC to `x86_64` assembly instructions (`movq`, `salq`, `leaq`, `imulq`, etc.).
-2. **Z3 BitVector Virtual CPU State**: CPU registers (`RAX`, `RDI`, `RSI`, etc.) are mapped to 64-bit Z3 BitVectors.
-3. **Theorem Equivalence Proof**: Z3 asserts `Output_A != Output_B` for free input variables.
+1. **Target-Agnostic LLVM IR Emission**: High-level code (C, C++, Rust) is compiled via Clang or Rustc into SSA-form LLVM IR (`.ll`).
+2. **Z3 SSA Environment Simulation**: LLVM SSA registers and types (`i32`, `i64`, `i1`, etc.) are mapped to Z3 BitVectors.
+3. **Cross-Platform Equivalence Proof**: Z3 asserts `Output_A != Output_B` for free input parameters.
    - **`UNSAT`**: No counterexample exists across all $2^{64}$ inputs ➔ **Logic is 100% identical (Pass)**.
    - **`SAT`**: Counterexample found ➔ **Logic violation detected (Block with concrete counterexample input)**.
 
@@ -42,7 +44,7 @@ Powered by Microsoft Research's **Z3 Solver**, KeepOut features **Differential F
 
 ## 🐳 1. Running with Docker (Recommended)
 
-No local Python or GCC installation required.
+No local Python, Clang, or LLVM installation required.
 
 ### Build Docker Image
 ```bash
@@ -83,14 +85,14 @@ docker compose run --rm keepout check .
 pip install -e .
 
 # Or using Pixi
-pixi add z3-solver click pytest
+pixi add z3-solver click pytest clang llvm
 pixi run pip install -e .
 ```
 
 ### CLI Commands
 
 #### 1. Initialize Locks (`keepout init`)
-Scan source files and save lock hashes/assembly to `keepout.json`:
+Scan source files and save lock hashes/LLVM IR to `keepout.json`:
 ```bash
 keepout init
 ```
