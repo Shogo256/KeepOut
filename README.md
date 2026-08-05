@@ -1,3 +1,11 @@
+```
+  🔒 _  _____ _____ _____   ____  _   _ _____ 
+  | |/ / ____| ____|  _ \ / __ \| | | |_   _|
+  | ' /|  _| |  _| | |_) | |  | | | | | | |  
+  | . \| |___| |___|  __/| |__| | |_| | | |  
+  |_|\_\_____|_____|_|    \____/ \___/  |_|  
+```
+
 # 🔒 KeepOut
 
 > **Production-ready, lightweight code protection powered by Smart Syntax Locking (AST Alpha-Renaming) & Deterministic Property-Based Testing (PBT).**

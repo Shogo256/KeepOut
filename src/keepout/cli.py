@@ -21,6 +21,14 @@ from keepout.core import (
     property_based_test_equivalence,
 )
 
+KEEPOUT_BANNER = r"""
+  🔒 _  _____ _____ _____   ____  _   _ _____ 
+  | |/ / ____| ____|  _ \ / __ \| | | |_   _|
+  | ' /|  _| |  _| | |_) | |  | | | | | | |  
+  | . \| |___| |___|  __/| |__| | |_| | | |  
+  |_|\_\_____|_____|_|    \____/ \___/  |_|  
+"""
+
 IGNORED_DIRS: Set[str] = {
     ".git", ".venv", ".pixi", "__pycache__", "node_modules", "build", "dist", "target", ".idea", ".vscode"
 }
@@ -58,6 +66,7 @@ def cli():
 @click.argument("target_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path), default=".")
 def init_cmd(target_dir: Path):
     """Scan source files and initialize/update keepout.json."""
+    click.echo(KEEPOUT_BANNER)
     root_dir = target_dir.resolve()
     db_path = root_dir / DEFAULT_DB_NAME
     
@@ -84,6 +93,7 @@ def init_cmd(target_dir: Path):
 @click.argument("target_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path), default=".")
 def check_cmd(target_dir: Path):
     """Check current source files against keepout.json."""
+    click.echo(KEEPOUT_BANNER)
     root_dir = target_dir.resolve()
     db_path = root_dir / DEFAULT_DB_NAME
 
