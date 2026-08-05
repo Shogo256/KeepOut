@@ -33,6 +33,19 @@ def test_python_formal_proof_pass_and_fail():
     assert "ARG_x" in res2.counterexample["inputs"]
 
 
+def test_mojo_formal_proof_pass_and_fail():
+    code_a = "fn calc(x: Int) -> Int:\n    return x * 4"
+    code_b = "fn calc(x: Int) -> Int:\n    return x << 2"
+    code_bad = "fn calc(x: Int) -> Int:\n    return x * 5"
+
+    res1 = prove_universal_equivalence(code_a, code_b, lang="mojo")
+    assert res1.is_equivalent is True
+
+    res2 = prove_universal_equivalence(code_a, code_bad, lang="mojo")
+    assert res2.is_equivalent is False
+    assert "ARG_x" in res2.counterexample["inputs"]
+
+
 def test_scheme_lisp_formal_proof_pass_and_fail():
     code_a = "(* x 4)"
     code_b = "(ash x 2)"

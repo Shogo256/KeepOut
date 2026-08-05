@@ -252,6 +252,16 @@ def compile_snippet_to_llvm_ir(snippet: str, lang: str = "c", symbol: Optional[s
             if res.returncode == 0:
                 return ir_file.read_text(encoding="utf-8")
 
+        elif lang in ["mojo", "🔥"]:
+            src_file = tmp_path / "code.mojo"
+            ir_file = tmp_path / "code.ll"
+            src_file.write_text(snippet, encoding="utf-8")
+
+            cmd = ["mojo", "build", "--emit=llvm", str(src_file), "-o", str(ir_file)]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                return ir_file.read_text(encoding="utf-8")
+
     return snippet
 
 
@@ -421,8 +431,13 @@ class LlvmIrInterpreter:
 # =====================================================================
 
 def parse_python_to_z3(code: str, env: Dict[str, z3.ExprRef]) -> z3.ExprRef:
-    """Parses Python code expression into Z3 BitVector expression."""
-    tree = ast.parse(code.strip())
+    """Parses Python and Mojo code expression into Z3 BitVector expression."""
+    clean_code = code
+    if "fn " in clean_code or "->" in clean_code:
+        clean_code = re.sub(r'\bfn\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*(?:->\s*[^:]+)?\s*:', r'def \1(\2):', clean_code)
+        clean_code = re.sub(r'([a-zA-Z0-9_]+)\s*:\s*[a-zA-Z0-9_]+', r'\1', clean_code)
+
+    tree = ast.parse(clean_code.strip())
     
     # Locate return or expression
     target_node = None
@@ -565,10 +580,18 @@ def prove_universal_equivalence(code_a: str, code_b: str, lang: str = "c") -> Eq
             expr_a = parse_generic_to_z3(code_a, shared_env)
             expr_b = parse_generic_to_z3(code_b, shared_env)
 
-    # 3. Python AST Engine
-    elif lang in ["py", "python"]:
-        expr_a = parse_python_to_z3(code_a, shared_env)
-        expr_b = parse_python_to_z3(code_b, shared_env)
+    # 3. Python & Mojo AST Engine
+    elif lang in ["py", "python", "mojo", "🔥"]:
+        try:
+            ir_a = compile_snippet_to_llvm_ir(code_a, lang=lang)
+            ir_b = compile_snippet_to_llvm_ir(code_b, lang=lang)
+            interp_a = LlvmIrInterpreter(shared_inputs=shared_env)
+            interp_b = LlvmIrInterpreter(shared_inputs=shared_env)
+            expr_a = interp_a.execute_llvm_ir(ir_a)
+            expr_b = interp_b.execute_llvm_ir(ir_b)
+        except Exception:
+            expr_a = parse_python_to_z3(code_a, shared_env)
+            expr_b = parse_python_to_z3(code_b, shared_env)
 
     # 4. Universal AST Engine (APL, Lisp, Guile, Verilog, Solidity, J, etc.)
     else:
