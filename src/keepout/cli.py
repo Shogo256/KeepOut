@@ -14,6 +14,7 @@ from keepout.core import (
     compute_strict_hash,
     compute_ast_hash,
     load_locks_db,
+    save_locks_db,
     sync_blocks_to_db,
     parse_file_locks,
     make_lock_key,
@@ -49,7 +50,7 @@ def find_source_files(root_dir: Path) -> List[Path]:
 @click.group()
 @click.version_option(version=__version__, prog_name="keepout")
 def cli():
-    """KeepOut - Smart Syntax Locking & Property-Based Testing Sub-Engine."""
+    """KeepOut - Smart Syntax Locking & Deterministic Property-Based Testing Sub-Engine."""
     pass
 
 
@@ -147,7 +148,7 @@ def check_cmd(target_dir: Path):
                     click.echo(f"🚨 [AST STRUCTURAL VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Code AST structure modified!", err=True)
                     violation_count += 1
 
-        # 3. Property-Based Testing Sub-Engine (PBT / Logic Lock)
+        # 3. Deterministic Property-Based Testing (PBT / Logic Lock)
         elif saved_info["mode"] in ["pbt", "logic"]:
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (logic lock - unmodified text)")
@@ -157,9 +158,17 @@ def check_cmd(target_dir: Path):
                 click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
             else:
                 orig_code = saved_info.get("original_code", block.content)
+                cached_ces = saved_info.get("cached_counterexamples", [])
                 
                 try:
-                    res = property_based_test_equivalence(orig_code, block.content, lang=ext, num_samples=10000)
+                    res = property_based_test_equivalence(
+                        orig_code,
+                        block.content,
+                        lang=ext,
+                        num_samples=10000,
+                        seed=42,
+                        cached_counterexamples=cached_ces
+                    )
 
                     if res.is_equivalent:
                         click.echo(f"✨ [PBT VERIFICATION PASS] {key} ({rel_path}:{block.start_line}) - {res.message}")
@@ -167,6 +176,16 @@ def check_cmd(target_dir: Path):
                         click.echo(f"🚨 [LOGIC VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Calculation logic modified!", err=True)
                         click.echo(f"  {res.message}", err=True)
                         violation_count += 1
+
+                        # Cache newly discovered counterexample into keepout.json for future regression prevention
+                        if res.counterexample and "input" in res.counterexample:
+                            new_ce = res.counterexample["input"]
+                            if new_ce not in cached_ces:
+                                cached_ces.append(new_ce)
+                                saved_info["cached_counterexamples"] = cached_ces
+                                db_data["locks"][key] = saved_info
+                                save_locks_db(db_path, db_data)
+                                click.echo(f"  📌 Automatically cached counterexample input ({new_ce}) into keepout.json for regression prevention.")
 
                 except Exception as err:
                     click.echo(f"🚨 [PBT ENGINE ERROR] {key} - Unable to perform property-based verification: {err}", err=True)

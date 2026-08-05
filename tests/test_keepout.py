@@ -50,22 +50,32 @@ def calculate(x):
 
 
 # =====================================================================
-# 2. Smart Property-Based Testing Sub-Engine (PBT / 10,000 Fuzzing Samples)
+# 2. Deterministic Property-Based Testing & Counterexample Caching
 # =====================================================================
 
-def test_property_based_testing_pass_and_fail():
+def test_deterministic_pbt_reproducibility_and_caching():
     code_a = "def calc(x):\n    return x * 4"
     code_b = "def calc(x):\n    return x << 2"
     code_bad = "def calc(x):\n    return x * 5"
 
-    res1 = property_based_test_equivalence(code_a, code_b, lang="py", num_samples=10000)
+    # Deterministic PBT pass
+    res1 = property_based_test_equivalence(code_a, code_b, lang="py", num_samples=10000, seed=42)
     assert res1.is_equivalent is True
     assert res1.status_str == "pbt_pass"
+    assert "seed=42" in res1.message
 
-    res2 = property_based_test_equivalence(code_a, code_bad, lang="py", num_samples=10000)
+    # Deterministic PBT fail
+    res2 = property_based_test_equivalence(code_a, code_bad, lang="py", num_samples=10000, seed=42)
     assert res2.is_equivalent is False
     assert res2.status_str == "pbt_fail"
-    assert res2.counterexample["input"] == 1 or res2.counterexample["input"] != 0
+
+    # Regression check using cached counterexample (input = 1)
+    res_cached = property_based_test_equivalence(
+        code_a, code_bad, lang="py", num_samples=10000, seed=42, cached_counterexamples=[1]
+    )
+    assert res_cached.is_equivalent is False
+    assert "Instant Regression Detected" in res_cached.message
+    assert res_cached.counterexample["input"] == 1
 
 
 # =====================================================================

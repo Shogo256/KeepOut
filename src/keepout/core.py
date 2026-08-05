@@ -1,4 +1,4 @@
-"""Core module for KeepOut: Smart Syntax Locking (AST Alpha-Renaming) & Property-Based Testing (PBT)."""
+"""Core module for KeepOut: Smart Syntax Locking & Deterministic PBT with Counterexample Caching."""
 
 import ast
 from dataclasses import dataclass
@@ -137,7 +137,7 @@ def parse_file_locks(file_path: Path) -> List[LockBlock]:
 # =====================================================================
 
 DEFAULT_DB_NAME = "keepout.json"
-VERSION = "1.0.0"
+VERSION = "2.0.0"  # Deterministic PBT with Counterexample Caching
 
 
 def compute_strict_hash(content: str) -> str:
@@ -171,17 +171,14 @@ class AstVariableNormalizer(ast.NodeTransformer):
 
 
 def compute_ast_hash(content: str, lang: str = "py") -> str:
-    """
-    Computes Smart Syntax Lock AST Hash.
-    Ignores whitespace, formatting, indentation, comments, and variable renames (alpha-renaming).
-    """
+    """Computes Smart Syntax Lock AST Hash (alpha-renaming, comments/formatting ignored)."""
     lang = lang.lower().lstrip(".")
     if lang in ["py", "python", "mojo", "🔥"]:
         try:
             clean = content
             if "fn " in clean or "->" in clean:
                 clean = re.sub(r'\bfn\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*(?:->\s*[^:]+)?\s*:', r'def \1(\2):', clean)
-                clean = re.sub(r'([a-zA-Z0-9_]+)\s*:\s*[a-zA-Z0-9_]+', r'\1', clean)
+                clean = re.sub(r'\b([a-zA-Z0-9_]+)\s*:\s*(?:Int|Float|String|Bool|[A-Z][a-zA-Z0-9_]*)\b', r'\1', clean)
             
             parsed_ast = ast.parse(clean.strip())
             normalized_ast = AstVariableNormalizer().visit(parsed_ast)
@@ -190,7 +187,6 @@ def compute_ast_hash(content: str, lang: str = "py") -> str:
         except Exception:
             pass
 
-    # Generic token-level AST structural normalization
     clean = re.sub(r'//.*|#.*|;|⍝.*|/\*.*?\*/', '', content)
     tokens = re.findall(r'[a-zA-Z0-9_]+|[^\s\w]', clean)
     normalized_struct = "".join(tokens)
@@ -224,8 +220,9 @@ def make_lock_key(rel_file_path: str, lock_index: int) -> str:
 
 
 def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) -> Dict[str, Any]:
-    """Updates keepout.json with LockBlocks."""
+    """Updates keepout.json with LockBlocks while preserving cached counterexamples."""
     db_data = load_locks_db(db_path)
+    existing_locks = db_data.get("locks", {})
     new_locks: Dict[str, Any] = {}
 
     for block in blocks:
@@ -239,6 +236,8 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
         ext = block.file_path.suffix.lstrip(".")
         ast_hash = compute_ast_hash(block.content, lang=ext)
 
+        cached_ces = existing_locks.get(key, {}).get("cached_counterexamples", [])
+
         new_locks[key] = {
             "file_path": rel_path,
             "lock_index": block.lock_index,
@@ -246,6 +245,7 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
             "strict_hash": content_hash,
             "ast_hash": ast_hash,
             "original_code": block.content,
+            "cached_counterexamples": cached_ces,
             "target_symbol": block.target_symbol,
             "start_line": block.start_line,
             "end_line": block.end_line,
@@ -258,7 +258,7 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
 
 
 # =====================================================================
-# 3. Smart Property-Based Testing Sub-Engine (PBT / Fuzzing)
+# 3. Deterministic Property-Based Testing (PBT) Engine with Counterexample Caching
 # =====================================================================
 
 @dataclass
@@ -269,19 +269,28 @@ class EquivalenceResult:
     counterexample: Optional[Dict[str, Any]] = None
 
 
-def property_based_test_equivalence(code_a: str, code_b: str, lang: str = "py", num_samples: int = 10000) -> EquivalenceResult:
+def property_based_test_equivalence(
+    code_a: str,
+    code_b: str,
+    lang: str = "py",
+    num_samples: int = 10000,
+    seed: int = 42,
+    cached_counterexamples: Optional[List[Any]] = None
+) -> EquivalenceResult:
     """
-    Executes Smart Property-Based Testing (PBT / Black-Box Fuzzing) across 10,000+ generated inputs.
-    Fully supports complex loops, recursion, external library calls, objects, and state mutations.
+    Executes Deterministic Property-Based Testing (PBT) across 10,000+ reproducible inputs.
+    - Fixes random seed to guarantee 100% deterministic, zero-flaky CI runs.
+    - Prioritizes cached counterexamples first for instant regression detection.
     """
     lang = lang.lower().lstrip(".")
+    cached_counterexamples = cached_counterexamples or []
 
     if lang in ["py", "python", "mojo", "🔥"]:
         try:
             clean_a = re.sub(r'\bfn\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*(?:->\s*[^:]+)?\s*:', r'def \1(\2):', code_a)
-            clean_a = re.sub(r'([a-zA-Z0-9_]+)\s*:\s*[a-zA-Z0-9_]+', r'\1', clean_a)
+            clean_a = re.sub(r'\b([a-zA-Z0-9_]+)\s*:\s*(?:Int|Float|String|Bool|[A-Z][a-zA-Z0-9_]*)\b', r'\1', clean_a)
             clean_b = re.sub(r'\bfn\s+([a-zA-Z0-9_]+)\s*\((.*?)\)\s*(?:->\s*[^:]+)?\s*:', r'def \1(\2):', code_b)
-            clean_b = re.sub(r'([a-zA-Z0-9_]+)\s*:\s*[a-zA-Z0-9_]+', r'\1', clean_b)
+            clean_b = re.sub(r'\b([a-zA-Z0-9_]+)\s*:\s*(?:Int|Float|String|Bool|[A-Z][a-zA-Z0-9_]*)\b', r'\1', clean_b)
 
             loc_a, loc_b = {}, {}
             exec(clean_a, {}, loc_a)
@@ -290,9 +299,30 @@ def property_based_test_equivalence(code_a: str, code_b: str, lang: str = "py", 
             func_a = [v for k, v in loc_a.items() if callable(v)][0]
             func_b = [v for k, v in loc_b.items() if callable(v)][0]
 
-            # Generate 10,000 Property-Based Test inputs (integers, edge cases, floats, lists)
+            # 1. First priority: Check against cached historical counterexamples (instant regression check)
+            for ce_val in cached_counterexamples:
+                try:
+                    res_a = func_a(ce_val)
+                    res_b = func_b(ce_val)
+                    if res_a != res_b:
+                        return EquivalenceResult(
+                            is_equivalent=False,
+                            status_str="pbt_fail",
+                            message=(
+                                f"🚨 Instant Regression Detected (Cached Counterexample)! Mismatch found:\n"
+                                f"  Cached Input: {ce_val}\n"
+                                f"  Expected Output (Original): {res_a}\n"
+                                f"  Actual Output (Modified): {res_b}"
+                            ),
+                            counterexample={"input": ce_val, "output_a": res_a, "output_b": res_b}
+                        )
+                except Exception:
+                    continue
+
+            # 2. Second priority: Run deterministic reproducible PBT with fixed seed
+            rng = random.Random(seed)
             edge_cases = [0, 1, -1, 42, -42, 2**16-1, 2**31-1, -2**31, 2**63-1, -2**63]
-            random_cases = [random.randint(-10**9, 10**9) for _ in range(num_samples - len(edge_cases))]
+            random_cases = [rng.randint(-10**9, 10**9) for _ in range(num_samples - len(edge_cases))]
             test_vector = edge_cases + random_cases
 
             for val in test_vector:
@@ -304,7 +334,7 @@ def property_based_test_equivalence(code_a: str, code_b: str, lang: str = "py", 
                             is_equivalent=False,
                             status_str="pbt_fail",
                             message=(
-                                f"🚨 Logic Mismatch Detected (PBT)! Counterexample found across 10,000 test cases:\n"
+                                f"🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
                                 f"  Input Parameter: {val}\n"
                                 f"  Expected Output (Original): {res_a}\n"
                                 f"  Actual Output (Modified): {res_b}"
@@ -317,7 +347,7 @@ def property_based_test_equivalence(code_a: str, code_b: str, lang: str = "py", 
             return EquivalenceResult(
                 is_equivalent=True,
                 status_str="pbt_pass",
-                message=f"✨ Passed Property-Based Testing across {num_samples} automated test inputs!"
+                message=f"✨ Passed Deterministic PBT across {num_samples} reproducible test inputs (seed={seed})!"
             )
         except Exception:
             pass
