@@ -182,6 +182,15 @@ def check_cmd(target_dir: Path):
 
                     if res.is_equivalent:
                         click.echo(f"✨ [PBT VERIFICATION PASS] {key} ({rel_path}:{block.start_line}) - {res.message}")
+                    elif res.status_str == "pbt_unverifiable":
+                        # Not a logic violation: the logic may be untouched.
+                        # It is a lock that did not check what it guards, and
+                        # saying so is the whole point -- a region reported
+                        # green without being reached is worse than one with
+                        # no lock on it.
+                        click.echo(f"🔍 [PBT UNVERIFIABLE] {key} ({rel_path}:{block.start_line}-{block.end_line}) - This lock verified nothing.", err=True)
+                        click.echo(f"  {res.message}", err=True)
+                        violation_count += 1
                     else:
                         click.echo(f"🚨 [LOGIC VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Calculation logic modified!", err=True)
                         click.echo(f"  {res.message}", err=True)

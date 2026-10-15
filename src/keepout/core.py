@@ -325,35 +325,80 @@ def property_based_test_equivalence(
             random_cases = [rng.randint(-10**9, 10**9) for _ in range(num_samples - len(edge_cases))]
             test_vector = edge_cases + random_cases
 
+            # A call that raises is skipped, which is right for a function
+            # that rejects some inputs -- and wrong as the only behaviour,
+            # because a function this engine CANNOT CALL AT ALL raises on
+            # every input and the loop ends having compared nothing. That is
+            # counted, and nothing compared is not a pass.
+            compared = 0
+            first_error = None
             for val in test_vector:
                 try:
                     res_a = func_a(val)
                     res_b = func_b(val)
-                    if res_a != res_b:
-                        return EquivalenceResult(
-                            is_equivalent=False,
-                            status_str="pbt_fail",
-                            message=(
-                                f"🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
-                                f"  Input Parameter: {val}\n"
-                                f"  Expected Output (Original): {res_a}\n"
-                                f"  Actual Output (Modified): {res_b}"
-                            ),
-                            counterexample={"input": val, "output_a": res_a, "output_b": res_b}
-                        )
-                except Exception:
+                except Exception as err:
+                    if first_error is None:
+                        first_error = f"{type(err).__name__}: {err}"
                     continue
+                compared += 1
+                if res_a != res_b:
+                    return EquivalenceResult(
+                        is_equivalent=False,
+                        status_str="pbt_fail",
+                        message=(
+                            f"🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
+                            f"  Input Parameter: {val}\n"
+                            f"  Expected Output (Original): {res_a}\n"
+                            f"  Actual Output (Modified): {res_b}"
+                        ),
+                        counterexample={"input": val, "output_a": res_a, "output_b": res_b}
+                    )
+
+            if compared == 0:
+                return EquivalenceResult(
+                    is_equivalent=False,
+                    status_str="pbt_unverifiable",
+                    message=(
+                        f"🔍 Nothing was verified. All {len(test_vector)} generated inputs "
+                        f"raised, so the two versions were never compared.\n"
+                        f"  First error: {first_error}\n"
+                        f"  This engine calls the target with ONE INTEGER argument and "
+                        f"execs the region in an empty namespace. A function taking "
+                        f"several arguments, or reading a module-level name, cannot be "
+                        f"reached -- use [LOCK: ast] for it, or hold its behaviour in a "
+                        f"test where the inputs can be written for its real signature.\n"
+                        f"  Reporting a pass here would be worse than having no lock: an "
+                        f"absent check is visible and a check that cannot fail is not."
+                    )
+                )
 
             return EquivalenceResult(
                 is_equivalent=True,
                 status_str="pbt_pass",
-                message=f"✨ Passed Deterministic PBT across {num_samples} reproducible test inputs (seed={seed})!"
+                message=(
+                    f"✨ Passed Deterministic PBT across {compared} of {num_samples} "
+                    f"reproducible test inputs (seed={seed}); "
+                    f"{num_samples - compared} were rejected by the function."
+                )
             )
-        except Exception:
-            pass
+        except Exception as err:
+            # exec failed, or no callable was found in the region. Either way
+            # the verification did not happen.
+            return EquivalenceResult(
+                is_equivalent=False,
+                status_str="pbt_unverifiable",
+                message=(
+                    f"🔍 Nothing was verified: the locked region could not be prepared "
+                    f"for testing.\n  {type(err).__name__}: {err}"
+                )
+            )
 
     return EquivalenceResult(
-        is_equivalent=True,
-        status_str="pbt_pass",
-        message="✨ Property-Based verification completed."
+        is_equivalent=False,
+        status_str="pbt_unverifiable",
+        message=(
+            f"🔍 Nothing was verified: no property-based engine exists for "
+            f"'{lang}'. Only Python and Mojo regions can be checked this way; "
+            f"use [LOCK: ast] or [LOCK: strict] for the rest."
+        )
     )

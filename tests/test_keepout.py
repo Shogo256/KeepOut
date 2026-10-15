@@ -122,3 +122,77 @@ def test_cli_smart_syntax_lock_mode(tmp_path: Path):
     res_fail = runner.invoke(cli, ["check", str(tmp_path)])
     assert res_fail.exit_code != 0
     assert "AST STRUCTURAL VIOLATION" in res_fail.output
+
+
+def test_a_region_the_engine_cannot_call_is_not_a_pass():
+    """The PBT engine calls the target with one integer argument and execs
+    the region in an empty namespace. A function taking several arguments, or
+    reading a module-level name, raises on every generated input.
+
+    Those raises are skipped, which is right for a function that rejects some
+    inputs. It used to be the only behaviour, so a function that could not be
+    called at all ended the loop having compared nothing and was reported as
+    passing -- including when its body was replaced wholesale.
+
+    A check that cannot fail is worse than no check: an absent lock is
+    visible, and a green one is not.
+    """
+    original = (
+        "FLOOR = 0.5\n"
+        "def verdict(share, ceiling, sampled):\n"
+        "    if share < FLOOR or ceiling > 0.05:\n"
+        "        return 'no'\n"
+        "    return 'maybe' if sampled else 'yes'\n"
+    )
+    gutted = (
+        "FLOOR = 0.5\n"
+        "def verdict(share, ceiling, sampled):\n"
+        "    return 'yes'\n"
+    )
+    result = property_based_test_equivalence(original, gutted, lang="py")
+    assert not result.is_equivalent
+    assert result.status_str == "pbt_unverifiable"
+    assert "verified nothing" in result.message or "Nothing was verified" in result.message
+    assert "TypeError" in result.message
+
+
+def test_a_language_with_no_engine_is_not_a_pass():
+    """There is no property-based engine for Rust or C. Returning a pass for
+    them said the behaviour had been checked when nothing had run."""
+    result = property_based_test_equivalence(
+        "fn add(a: i64) -> i64 { a + 1 }",
+        "fn add(a: i64) -> i64 { a + 2 }",
+        lang="rs",
+    )
+    assert not result.is_equivalent
+    assert result.status_str == "pbt_unverifiable"
+
+
+def test_a_callable_function_still_verifies_and_still_catches_a_change():
+    """The fix must not turn working locks into failures: a single-argument
+    function with no outside references is exactly what this engine is for."""
+    same = property_based_test_equivalence(
+        "def f(x):\n    return x * 2\n",
+        "def f(y):\n    result = y + y\n    return result\n",
+        lang="py",
+    )
+    assert same.is_equivalent
+    assert same.status_str == "pbt_pass"
+
+    changed = property_based_test_equivalence(
+        "def f(x):\n    return x * 2\n",
+        "def f(x):\n    return x * 3\n",
+        lang="py",
+    )
+    assert not changed.is_equivalent
+    assert changed.status_str == "pbt_fail"
+    assert changed.counterexample is not None
+
+
+def test_inputs_a_function_rejects_do_not_make_it_unverifiable():
+    """Some inputs raising is normal. The count that matters is whether ANY
+    comparison happened, not whether every one did."""
+    body = "def f(x):\n    if x < 0:\n        raise ValueError('negative')\n    return x * 2\n"
+    result = property_based_test_equivalence(body, body, lang="py")
+    assert result.is_equivalent
+    assert result.status_str == "pbt_pass"
