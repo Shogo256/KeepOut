@@ -2,18 +2,25 @@
 
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
+import tempfile
 from typing import List, Set
 import click
 
 from keepout import __version__
 from keepout.core import (
     DEFAULT_DB_NAME,
+    VERSION,
     LockBlock,
+    LockDatabaseError,
     LockParserError,
+    canonical_mode,
     compute_strict_hash,
     compute_ast_hash,
     load_locks_db,
+    python_ast_hash,
     save_locks_db,
     sync_blocks_to_db,
     parse_file_locks,
@@ -81,7 +88,17 @@ def init_cmd(target_dir: Path):
             click.echo(f"🚨 Parse Error: {e}", err=True)
             sys.exit(1)
 
-    db_data = sync_blocks_to_db(db_path, all_blocks, root_dir)
+    try:
+        db_data = sync_blocks_to_db(db_path, all_blocks, root_dir)
+    except LockDatabaseError as e:
+        click.echo(f"🚨 Error: {e}", err=True)
+        click.echo(
+            f"  init does not overwrite a {DEFAULT_DB_NAME} it cannot read. Restore it from "
+            f"version control, or delete it and run init again to rebuild it from the "
+            f"current source (its cached counterexamples are lost).",
+            err=True,
+        )
+        sys.exit(1)
     locks = db_data.get("locks", {})
 
     click.echo(f"🔒 KeepOut initialized! Registered {len(locks)} lock region(s) in {db_path.name}")
@@ -89,20 +106,87 @@ def init_cmd(target_dir: Path):
         click.echo(f"  • {key} (mode: {info['mode']})")
 
 
+def export_staged_files(repo_dir: Path, dest: Path) -> None:
+    """Writes the staged (index) version of every file keepout reads into dest.
+
+    Paths stay relative to repo_dir, so lock keys match the working tree's.
+    """
+    listing = subprocess.run(
+        ["git", "-C", str(repo_dir), "ls-files", "-z", "--cached"],
+        capture_output=True, check=True,
+    ).stdout
+    wanted = []
+    for raw in listing.split(b"\0"):
+        name = Path(os.fsdecode(raw))
+        if raw and (name.suffix.lower() in SUPPORTED_EXTENSIONS or name.name == DEFAULT_DB_NAME):
+            wanted.append(raw)
+    if wanted:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "checkout-index", "-z", "--stdin", f"--prefix={dest}{os.sep}"],
+            input=b"\0".join(wanted), capture_output=True, check=True,
+        )
+
+
 @cli.command(name="check")
 @click.argument("target_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path), default=".")
-def check_cmd(target_dir: Path):
+@click.option(
+    "--staged", is_flag=True,
+    help="Check what is staged for commit (the git index), not the working tree. The pre-commit hook uses this.",
+)
+@click.option(
+    "--no-unlock", "no_unlock", is_flag=True,
+    help="Ignore UNLOCK_REASON comments, so an unlocked edit is checked like any other. For CI where automated agents can commit.",
+)
+def check_cmd(target_dir: Path, staged: bool, no_unlock: bool):
     """Check current source files against keepout.json."""
     click.echo(KEEPOUT_BANNER)
-    root_dir = target_dir.resolve()
+    if not staged:
+        run_check(target_dir.resolve(), allow_unlock=not no_unlock)
+
+    # Checking the working tree in a pre-commit hook let a staged violation
+    # through whenever the file on disk had been put back: what gets
+    # committed is the index, so that is what is checked.
+    with tempfile.TemporaryDirectory(prefix="keepout-staged-") as tmp:
+        try:
+            export_staged_files(target_dir.resolve(), Path(tmp))
+        except (OSError, subprocess.CalledProcessError) as e:
+            detail = getattr(e, "stderr", b"") or b""
+            click.echo(f"🚨 Error: could not read the staged files with git: {e} {detail.decode(errors='replace').strip()}", err=True)
+            sys.exit(1)
+        run_check(Path(tmp).resolve(), allow_unlock=not no_unlock)
+
+
+def run_check(root_dir: Path, allow_unlock: bool = True) -> None:
+    """Checks root_dir against its keepout.json and exits with the result."""
     db_path = root_dir / DEFAULT_DB_NAME
 
     if not db_path.exists():
         click.echo(f"🚨 Error: {DEFAULT_DB_NAME} not found. Run 'keepout init' first.", err=True)
         sys.exit(1)
 
-    db_data = load_locks_db(db_path)
-    saved_locks = db_data.get("locks", {})
+    try:
+        db_data = load_locks_db(db_path)
+    except LockDatabaseError as e:
+        click.echo(f"🚨 Error: {e}", err=True)
+        click.echo(
+            f"  A lock record that cannot be read verifies nothing, so the check fails. "
+            f"Restore {DEFAULT_DB_NAME} from version control, or delete it and run "
+            f"'keepout init' to re-register every lock from the current source.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if db_data.get("version") != VERSION:
+        click.echo(
+            f"🚨 Error: {DEFAULT_DB_NAME} was written with hash format "
+            f"{db_data.get('version')!r}; this keepout uses {VERSION!r}, and the two "
+            f"AST hashes are not comparable. Review the locked regions, then run "
+            f"'keepout init' to re-register them.",
+            err=True,
+        )
+        sys.exit(1)
+
+    saved_locks = db_data["locks"]
 
     source_files = find_source_files(root_dir)
     current_blocks: List[LockBlock] = []
@@ -124,50 +208,74 @@ def check_cmd(target_dir: Path):
         except ValueError:
             rel_path = block.file_path.as_posix()
 
-        key = make_lock_key(rel_path, block.lock_index)
+        key = make_lock_key(rel_path, block.lock_id)
         checked_keys.add(key)
 
+        # A lock with no record was only a warning, so deleting entries from
+        # keepout.json (or emptying it to {"locks": {}}) switched those locks
+        # off while the check stayed green.
         if key not in saved_locks:
-            click.echo(f"⚠️ WARNING: Unregistered lock [{key}] at {rel_path}:{block.start_line}. Run 'keepout init'.")
+            click.echo(f"🚨 [UNREGISTERED LOCK] {key} ({rel_path}:{block.start_line}) - No record in {DEFAULT_DB_NAME}, so nothing was checked. Run 'keepout init' to register it.", err=True)
+            violation_count += 1
             continue
 
         saved_info = saved_locks[key]
+
+        # The check runs the mode recorded in keepout.json; one edit there
+        # could turn a strict lock into an ast lock without touching source.
+        if canonical_mode(saved_info["mode"]) != canonical_mode(block.mode):
+            click.echo(f"🚨 [MODE MISMATCH] {key} ({rel_path}:{block.start_line}) - Source says '{block.mode}' but {DEFAULT_DB_NAME} records '{saved_info['mode']}'. Run 'keepout init' if the change is intended.", err=True)
+            violation_count += 1
+            continue
+
         current_hash = compute_strict_hash(block.content)
         ext = block.file_path.suffix.lstrip(".")
         current_ast_hash = compute_ast_hash(block.content, lang=ext)
+
+        unlock_reason = block.unlock_reason if allow_unlock else None
+        if block.unlock_reason and not allow_unlock:
+            click.echo(f"ℹ️ {key}: UNLOCK_REASON \"{block.unlock_reason}\" ignored (--no-unlock).")
 
         # 1. Strict Lock Mode (Byte/Text SHA-256)
         if saved_info["mode"] == "strict":
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (strict lock intact)")
             else:
-                if block.unlock_reason:
-                    click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
+                if unlock_reason:
+                    click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{unlock_reason}\"")
                 else:
                     click.echo(f"🚨 [LOCK VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Strict lock region modified!", err=True)
                     violation_count += 1
 
         # 2. Smart Syntax Lock Mode (AST Structural & Variable Alpha-Rename Hash - Default)
         elif saved_info["mode"] in ["ast", "default"]:
-            if current_ast_hash == saved_info.get("ast_hash"):
+            if current_ast_hash == saved_info["ast_hash"]:
                 click.echo(f"✅ [PASS] {key} (Smart Syntax Lock - formatting, comments & variable renames ignored)")
             else:
-                if block.unlock_reason:
-                    click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
+                if unlock_reason:
+                    click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{unlock_reason}\"")
                 else:
                     click.echo(f"🚨 [AST STRUCTURAL VIOLATION] {key} ({rel_path}:{block.start_line}-{block.end_line}) - Code AST structure modified!", err=True)
                     violation_count += 1
 
         # 3. Deterministic Property-Based Testing (PBT / Logic Lock)
         elif saved_info["mode"] in ["pbt", "logic"]:
+            # An equal AST hash stands in for PBT only when it is a real
+            # Python AST hash. The token fallback used for everything else
+            # ignores '#' lines, '//' to end of line and whitespace, so
+            # trusting it let `#[cfg(test)]` or `#if 0` through a logic lock
+            # without PBT ever running.
+            current_py_hash = python_ast_hash(block.content, ext)
             if current_hash == saved_info["strict_hash"]:
                 click.echo(f"✅ [PASS] {key} (logic lock - unmodified text)")
-            elif current_ast_hash == saved_info.get("ast_hash"):
+            elif current_py_hash is not None and current_py_hash == saved_info["ast_hash"]:
                 click.echo(f"✅ [PASS] {key} (logic lock - AST structural match)")
-            elif block.unlock_reason:
-                click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{block.unlock_reason}\"")
+            elif unlock_reason:
+                click.echo(f"⚠️ [UNLOCKED] {key} modified with reason: \"{unlock_reason}\"")
             else:
-                orig_code = saved_info.get("original_code", block.content)
+                # Falling back to the current code here compared the edit with
+                # itself, so an entry without original_code always passed.
+                orig_code = saved_info["original_code"]
                 cached_ces = saved_info.get("cached_counterexamples", [])
                 
                 try:
@@ -225,22 +333,27 @@ def check_cmd(target_dir: Path):
 
 PRE_COMMIT_MARKER = "# KEEPOUT_PRE_COMMIT_HOOK"
 
+# The check runs on the staged content, and a missing keepout blocks the
+# commit: the old block checked the working tree and, without keepout on
+# PATH, printed "Skipping check" and let the commit through.
 PRE_COMMIT_SCRIPT_BLOCK = f"""{PRE_COMMIT_MARKER}
-echo "🔒 Running KeepOut pre-commit check..."
+echo "🔒 Running KeepOut pre-commit check on the staged content..."
 if command -v pixi >/dev/null 2>&1 && pixi run keepout --version >/dev/null 2>&1; then
-    pixi run keepout check .
+    pixi run keepout check --staged . || {{ echo "🚨 KeepOut pre-commit check failed! Commit blocked."; exit 1; }}
 elif command -v keepout >/dev/null 2>&1; then
-    keepout check .
+    keepout check --staged . || {{ echo "🚨 KeepOut pre-commit check failed! Commit blocked."; exit 1; }}
 else
-    echo "⚠️ keepout executable not found in PATH or pixi env. Skipping check."
-fi
-
-if [ $? -ne 0 ]; then
-    echo "🚨 KeepOut pre-commit check failed! Commit blocked."
+    echo "🚨 keepout was not found in PATH or the pixi environment, so the locks were not checked. Commit blocked."
+    echo "   Install keepout, or run 'git commit --no-verify' to skip the check on purpose."
     exit 1
 fi
 {PRE_COMMIT_MARKER}_END
 """
+
+_HOOK_BLOCK_PATTERN = re.compile(
+    re.escape(PRE_COMMIT_MARKER) + r"\n.*?" + re.escape(f"{PRE_COMMIT_MARKER}_END") + r"\n?",
+    re.DOTALL,
+)
 
 
 @cli.command(name="install-hook")
@@ -260,20 +373,51 @@ def install_hook_cmd(target_dir: Path):
 
     if hook_file.exists():
         content = hook_file.read_text(encoding="utf-8")
-        if PRE_COMMIT_MARKER in content:
+        if PRE_COMMIT_SCRIPT_BLOCK in content:
             click.echo("ℹ️ KeepOut pre-commit hook is already installed.")
             sys.exit(0)
+        if _HOOK_BLOCK_PATTERN.search(content):
+            # An older KeepOut block: replace it where it stands.
+            new_content = _HOOK_BLOCK_PATTERN.sub(lambda _: PRE_COMMIT_SCRIPT_BLOCK, content, count=1)
+            action = "Updated"
         else:
-            new_content = content.rstrip() + "\n\n" + PRE_COMMIT_SCRIPT_BLOCK
+            # First, right after the shebang: appended at the end, the block
+            # never ran when the existing hook ended with `exit 0` or `exec`.
+            first, sep, rest = content.partition("\n")
+            if first.startswith("#!"):
+                new_content = first + "\n\n" + PRE_COMMIT_SCRIPT_BLOCK + "\n" + rest
+            else:
+                new_content = PRE_COMMIT_SCRIPT_BLOCK + "\n" + content
+            action = "Installed"
     else:
         new_content = "#!/bin/sh\n\n" + PRE_COMMIT_SCRIPT_BLOCK
+        action = "Installed"
 
     hook_file.write_text(new_content, encoding="utf-8")
-    
+
     mode = hook_file.stat().st_mode
     hook_file.chmod(mode | 0o111)
 
-    click.echo(f"🪝 Successfully installed KeepOut pre-commit hook at {hook_file}")
+    click.echo(f"🪝 {action} KeepOut pre-commit hook at {hook_file}")
+
+    hooks_path = subprocess.run(
+        ["git", "-C", str(root_dir), "config", "--get", "core.hooksPath"],
+        capture_output=True, text=True,
+    ).stdout.strip() if _git_available() else ""
+    if hooks_path:
+        click.echo(
+            f"⚠️ core.hooksPath is set to '{hooks_path}', so git will not run {hook_file}. "
+            f"Add the KeepOut block to the pre-commit hook there.",
+            err=True,
+        )
+
+
+def _git_available() -> bool:
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
 
 
 if __name__ == "__main__":
