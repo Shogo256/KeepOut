@@ -8,21 +8,21 @@
 
 # 🔒 KeepOut
 
-> **Production-ready, lightweight code protection powered by Smart Syntax Locking (AST Alpha-Renaming) & Deterministic Property-Based Testing (PBT).**
+> **Lightweight code protection powered by Smart Syntax Locking (AST Alpha-Renaming) & Deterministic Property-Based Testing (PBT).**
 
-**KeepOut** is a lightweight CLI tool designed to physically protect critical code sections from external changes—whether caused by future oversights, unintended edits by teammates, or automated AI refactorings—by marking regions with comment directives (`# [LOCK]` ... `# [/LOCK]`).
+**KeepOut** is a lightweight CLI tool that makes changes to critical code sections visible and blocks them in CI or a pre-commit hook—whether caused by future oversights, unintended edits by teammates, or automated AI refactorings—by marking regions with comment directives (`# [LOCK]` ... `# [/LOCK]`).
 
-Refactored for maximum production usability, KeepOut features **Smart Syntax Locking** ($O(1)$ AST Structural Hash & Variable Alpha-Renaming) and **Deterministic Property-Based Testing (10,000+ Reproducible Fuzzing Samples + Counterexample Caching)**, ensuring instant verification, zero flaky CI builds, and zero freezes across large-scale repositories.
+KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renaming of local variables) and **Deterministic Property-Based Testing** (10,000 reproducible inputs, boundary values taken from the code itself, and counterexample caching). Read [What KeepOut does not catch](#-what-keepout-does-not-catch) before relying on it.
 
 ---
 
-## 🌟 2 Core Production Engines
+## 🌟 Lock Modes
 
-| Engine | Syntax Directive | How It Works | Performance & Reliability | Ideal Use Case |
+| Engine | Syntax Directive | How It Works | Cost | Ideal Use Case |
 | :--- | :--- | :--- | :--- | :--- |
-| **Smart Syntax Lock** *(Default)* | `# [LOCK]` or `# [LOCK: ast]` | **AST Alpha-Renaming & Structural Hash**. Ignores comments, whitespace, formatting, indentation, and variable renames (`x` ➔ `val`). | ⚡ $O(1)$ (<1ms)<br>Zero freezes | Formatting & linting-heavy codebases where code structure must stay intact. |
-| **Deterministic PBT Sub-Engine** | `# [LOCK: pbt]` or `# [LOCK: logic]` | **Deterministic Property-Based Testing (10,000 Samples)** + **Counterexample Auto-Caching**. Reproducible fixed seed (`seed=42`). | 🎯 Milliseconds<br>Zero Flaky CI Runs | Core algorithms, AI refactorings, functions with complex loops or external libraries. |
-| **Strict Lock** | `# [LOCK: strict]` | SHA-256 exact byte hash matching. Rejects any edit including spaces or comments. | ⚡ $O(1)$ Instantaneous | Security constants, preventing re-occurrence of critical bugs. |
+| **Smart Syntax Lock** *(Default)* | `# [LOCK]` or `# [LOCK: ast]` | **AST Alpha-Renaming & Structural Hash**. Ignores comments, whitespace, formatting, and renames of parameters and local variables (`x` ➔ `val`). Names visible outside the function — callees, builtins, globals, and the functions, classes and constants the region defines — must stay as written. Renames are recognised in Python only; other languages get a token hash that ignores comments and formatting. | Linear in region size (about 7 ms per 100 lines of Python) | Formatting & linting-heavy codebases where code structure must stay intact. |
+| **Deterministic PBT Sub-Engine** | `# [LOCK: pbt]` or `# [LOCK: logic]` | Calls **every top-level function** in the region with the same 10,000+ integers, in the original and the edited version, and compares return values *and* raised exceptions. Python and Mojo only. | About 0.2–0.5 s per edited region (a separate Python process); at most 1 s per call and 60 s per region | Pure functions of **one integer argument** whose implementation may be refactored. |
+| **Strict Lock** | `# [LOCK: strict]` | SHA-256 exact byte hash matching. Rejects any edit including spaces or comments. | Linear in region size | Security constants, preventing re-occurrence of critical bugs. |
 
 ---
 
@@ -30,24 +30,28 @@ Refactored for maximum production usability, KeepOut features **Smart Syntax Loc
 
 ```
 [ Original Code ]  ──┐
-                     ├──> [ AST Alpha-Renaming Engine ] ──> Match? ➔ PASS ✨ (<0.001s)
+                     ├──> [ Python AST Alpha-Renaming ] ──> Match? ➔ PASS ✨ (Python regions only)
 [ Modified Code ]  ──┘                   │
- (Variable renames,                      └── Mismatch? (AST Structure Altered)
+ (Local renames,                         └── Mismatch, or not Python
   comments, formatting                             │
   ignored automatically)                           ▼
-                                     [ 1. Check Cached Counterexamples ] (keepout.json)
+                                     [ 1. Re-try Cached Counterexamples ] (keepout.json)
                                                    │
-                                                   ├── Fail? ➔ Instant Regression Block 🚨 (0.0001s)
+                                                   ├── Fail? ➔ Instant Regression Block 🚨
                                                    └── Pass? ➔ [ 2. Deterministic PBT Engine ]
-                                                               (10,000 Reproducible Inputs, seed=42)
+                                                               (edge cases, every integer in -256..256,
+                                                                c-1/c/c+1/-c for each literal c in the code,
+                                                                random integers up to 10,000 inputs, seed=42)
                                                                        │
-                                                                       ├── Output Match ➔ PASS ✨
-                                                                       └── Discrepancy ➔ BLOCK 🚨
-                                                                           (Auto-cache Counterexample)
+                                                                       ├── Same results & exceptions ➔ PASS ✨
+                                                                       ├── Discrepancy ➔ BLOCK 🚨 (Auto-cache Counterexample)
+                                                                       └── Nothing could be compared ➔ UNVERIFIABLE 🔍 (fails the check)
 ```
 
-1. **Deterministic Seed (No Flaky Tests)**: Fixed PRNG seed guarantees 100% reproducible test vectors across local and CI runs.
-2. **Counterexample Caching**: When a bug or logic mismatch is caught, KeepOut automatically caches the failing input parameter inside `keepout.json`. On subsequent checks, KeepOut checks cached counterexamples **first**, preventing regressions in 0.0001 seconds.
+1. **Deterministic Inputs (No Flaky Tests)**: The inputs depend only on the seed and on the code, so local and CI runs test the same values.
+2. **Boundaries from the code**: Each integer literal in either version contributes its neighbours, so `x >= 18` ➔ `x > 18` or a special case for `x == 123456789` is caught. Values the code does not mention, outside -256..256, are only sampled at random.
+3. **Counterexample Caching**: When a mismatch is caught, KeepOut stores the failing input in `keepout.json` (so `check` writes to that file) and tries it first on later checks.
+4. **UNVERIFIABLE is a failure**: A function the engine cannot call — several arguments, non-integer input, names defined outside the region — is reported as verifying nothing rather than passing. Use an ast or strict lock for it.
 
 ---
 
@@ -96,11 +100,13 @@ keepout install-hook
 
 ## 📜 Directive Syntax Protocol
 
-### 🌿 Smart Syntax Lock (Default: Structure Fixed, Formatting & Renames Ignored)
+Directives must start a comment line (`#`, `//`, `/*`, `;` or `⍝`). The mode is one of `strict`, `ast`, `pbt` or `logic`; anything else is an error rather than a silent fallback to `ast`.
+
+### 🌿 Smart Syntax Lock (Default: Structure Fixed, Formatting & Local Renames Ignored)
 ```python
 # [LOCK: ast name="calc"]
 def calculate_product(input_value):
-    # Variable renames, comments, and formatting edits are allowed
+    # Local variable renames, comments, and formatting edits are allowed
     result_value = input_value * 4
     return result_value
 # [/LOCK]
@@ -116,10 +122,34 @@ fn fast_calc(x: Int) -> Int:
 
 ### 🔒 Strict Lock (Exact Byte Freeze)
 ```c
-// [LOCK: strict]
+// [LOCK: strict name="max_retry"]
 const int MAX_RETRY_COUNT = 5;
 // [/LOCK]
 ```
+
+### 🏷️ Naming locks
+`name="..."` (letters, digits, `_`, `.`, `-`) is the lock's identity in `keepout.json`: `src/app.py#calc`. Unnamed locks are numbered among the unnamed locks of their file (`src/app.py#lock_0`), so adding an unnamed lock above them shifts their keys. Name every lock you expect to keep.
+
+### 🔓 Unlocking on purpose
+A comment line `UNLOCK_REASON: <why>` inside the region (or after the `[LOCK]` directive on its line) lets an edit pass, reported as `UNLOCKED`. Anyone who can edit the file can add one, an AI agent included. In CI where agents can commit, run `keepout check --no-unlock` so unlock comments are ignored. Afterwards, remove the comment and run `keepout init` to record the new code.
+
+### 🪝 Pre-commit hook
+`keepout install-hook` adds a block that runs `keepout check --staged` — the content being committed, not the files on disk — and blocks the commit when keepout cannot be found. `git commit --no-verify` skips it deliberately.
+
+---
+
+## ⚠️ What KeepOut does not catch
+
+- **Anyone who can write to the repository can re-lock.** `keepout init` records whatever the code is now. KeepOut makes a change visible and fails a check; it does not stop a person or agent who also edits `keepout.json` or re-runs `init`. Review changes to `keepout.json` like code.
+- **Code outside the region.** Redefining a locked function later in the file, or monkeypatching it elsewhere, does not touch the region.
+- **PBT only sees what it can call.** Each top-level function is called with one integer. Behaviour for other inputs (floats, strings, large values the code never mentions) is not tested.
+- **Renames outside Python.** For other languages the ast lock compares tokens: comments and formatting are ignored, renaming a variable is a change.
+- **`keepout.json` from an older keepout.** A database written with a different hash format is refused; review the regions and run `keepout init`.
+
+## 🛡️ Security notes
+
+- **`pbt` locks execute code.** Checking an edited pbt region runs both the edited region and the original recorded in `keepout.json`, in a separate Python process with time limits but with your user's permissions: file writes and network calls in that code really happen. Do not put pbt locks on code with side effects, and run `keepout check` only where you would run the project's tests.
+- `keepout check` refuses a `keepout.json` that is unreadable, malformed, or whose recorded `original_code` does not match its `strict_hash`, instead of treating it as empty.
 
 ---
 
