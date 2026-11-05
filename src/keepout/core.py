@@ -672,6 +672,8 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
             "original_code": block.content,
             "cached_counterexamples": cached_ces,
             "target_symbol": block.target_symbol,
+            # Recorded so that the same reason cannot unlock the next change.
+            "unlock_reason": block.unlock_reason,
             "start_line": block.start_line,
             "end_line": block.end_line,
         }

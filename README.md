@@ -89,8 +89,12 @@ pixi run pip install -e .
 # Initialize locks in keepout.json
 keepout init
 
-# Verify lock integrity
+# Verify lock integrity against keepout.json
 keepout check
+
+# Verify against the code at the branch point with main, read from git
+# (what CI should run; see "Checking in CI" below)
+keepout check --base origin/main
 
 # Install Git Pre-commit hook
 keepout install-hook
@@ -131,16 +135,39 @@ const int MAX_RETRY_COUNT = 5;
 `name="..."` (letters, digits, `_`, `.`, `-`) is the lock's identity in `keepout.json`: `src/app.py#calc`. Unnamed locks are numbered among the unnamed locks of their file (`src/app.py#lock_0`), so adding an unnamed lock above them shifts their keys. Name every lock you expect to keep.
 
 ### 🔓 Unlocking on purpose
-A comment line `UNLOCK_REASON: <why>` inside the region (or after the `[LOCK]` directive on its line) lets an edit pass, reported as `UNLOCKED`. Anyone who can edit the file can add one, an AI agent included. In CI where agents can commit, run `keepout check --no-unlock` so unlock comments are ignored. Afterwards, remove the comment and run `keepout init` to record the new code.
+A comment line `UNLOCK_REASON: <why>` inside the region (or after the `[LOCK]` directive on its line) lets one edit pass, reported as `UNLOCKED`. A reason the baseline already carries — the same text in `keepout.json` or in the `--base` commit — does not unlock again: the next change needs a new reason. Anyone who can edit the file can add one, an AI agent included. In CI where agents can commit, run `keepout check --no-unlock` so unlock comments are ignored. After an unlocked change, run `keepout init` to record the new code.
 
 ### 🪝 Pre-commit hook
-`keepout install-hook` adds a block that runs `keepout check --staged` — the content being committed, not the files on disk — and blocks the commit when keepout cannot be found. `git commit --no-verify` skips it deliberately.
+`keepout install-hook` adds a block that runs `keepout check --staged --base HEAD`: the content being committed, not the files on disk, compared with the last commit as git has it. A locked region changed in the commit fails even if the same commit re-records it in `keepout.json`. The hook blocks the commit when keepout cannot be found; `git commit --no-verify` skips it deliberately. Re-run `install-hook` after upgrading to replace an older block.
+
+### 🔎 Checking in CI
+`keepout check --base <ref>` compares every locked region with the same region at the merge base of `<ref>` and `HEAD`, read from git. `keepout.json` decides nothing in this mode, so a pull request that edits a locked region and re-records it still fails, and a logic lock runs the base commit's code as the original, never `keepout.json`'s copy. A lock removed or weakened (`strict` ➔ `ast`) fails; a new lock passes and is checked from the next change on.
+
+```yaml
+# .github/workflows/keepout.yml
+name: keepout
+on: pull_request
+jobs:
+  locks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # --base needs the base branch's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "git+https://github.com/Shogo256/KeepOut@v0.2.0"
+      - run: keepout check --base "origin/${{ github.base_ref }}" --no-unlock
+```
+
+Make the job a required check, and put locked files and `keepout.json` under `CODEOWNERS` so a person approves any change to them.
 
 ---
 
 ## ⚠️ What KeepOut does not catch
 
-- **Anyone who can write to the repository can re-lock.** `keepout init` records whatever the code is now. KeepOut makes a change visible and fails a check; it does not stop a person or agent who also edits `keepout.json` or re-runs `init`. Review changes to `keepout.json` like code.
+- **Without `--base`, anyone who can write to the repository can re-lock.** `keepout init` records whatever the code is now, and plain `keepout check` trusts that record. Use `--base` in CI and the hook; it compares with git instead. Even then KeepOut fails a check — it cannot stop someone who can merge without it, or who deletes the CI job. Make the check required and review `keepout.json` and locked files through `CODEOWNERS`.
 - **Code outside the region.** Redefining a locked function later in the file, or monkeypatching it elsewhere, does not touch the region.
 - **PBT only sees what it can call.** Each top-level function is called with one integer. Behaviour for other inputs (floats, strings, large values the code never mentions) is not tested.
 - **Renames outside Python.** For other languages the ast lock compares tokens: comments and formatting are ignored, renaming a variable is a change.
@@ -148,7 +175,7 @@ A comment line `UNLOCK_REASON: <why>` inside the region (or after the `[LOCK]` d
 
 ## 🛡️ Security notes
 
-- **`pbt` locks execute code.** Checking an edited pbt region runs both the edited region and the original recorded in `keepout.json`, in a separate Python process with time limits but with your user's permissions: file writes and network calls in that code really happen. Do not put pbt locks on code with side effects, and run `keepout check` only where you would run the project's tests.
+- **`pbt` locks execute code.** Checking an edited pbt region runs both the edited region and the original — recorded in `keepout.json`, or with `--base` taken from the base commit — in a separate Python process with time limits but with your user's permissions: file writes and network calls in that code really happen. Do not put pbt locks on code with side effects, and run `keepout check` only where you would run the project's tests.
 - `keepout check` refuses a `keepout.json` that is unreadable, malformed, or whose recorded `original_code` does not match its `strict_hash`, instead of treating it as empty.
 
 ---

@@ -838,3 +838,164 @@ def test_a_hand_edited_original_code_is_refused_before_it_runs(tmp_path: Path):
     result = runner.invoke(cli, ["check", str(tmp_path)])
     assert result.exit_code != 0
     assert not marker.exists()
+
+
+# =====================================================================
+# 11. --base: the baseline is the code in git, not keepout.json
+# =====================================================================
+
+def _plain_git_env(tmp_path: Path) -> dict:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    return {
+        **os.environ, "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+
+
+def _commit(repo: Path, env: dict, files: dict, message: str = "change") -> None:
+    for name, text in files.items():
+        path = repo / name
+        if text is None:
+            path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=repo, env=env, check=True)
+
+
+def _repo(tmp_path: Path, files: dict, init: bool = True):
+    env = _plain_git_env(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], env=env, check=True)
+    for name, text in files.items():
+        (repo / name).write_text(text, encoding="utf-8")
+    if init:
+        assert CliRunner().invoke(cli, ["init", str(repo)]).exit_code == 0
+    _commit(repo, env, {}, "base")
+    return repo, env
+
+
+@needs_git
+def test_base_check_catches_a_change_rerecorded_in_keepout_json(tmp_path: Path):
+    """Compared with keepout.json, editing a locked region and running
+    `keepout init` passed: the record now said the edit was the original.
+    Compared with the code at the base commit, it is a change."""
+    repo, _ = _repo(tmp_path, {"main.py": STRICT_SRC})
+    (repo / "main.py").write_text(STRICT_MOD, encoding="utf-8")
+    runner = CliRunner()
+    assert runner.invoke(cli, ["init", str(repo)]).exit_code == 0
+
+    against_record = runner.invoke(cli, ["check", str(repo)])
+    assert against_record.exit_code == 0  # the hole --base closes
+
+    against_git = runner.invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert against_git.exit_code != 0
+    assert "LOCK VIOLATION" in against_git.output
+    assert "re-records main.py#lock_0" in against_git.output
+
+
+@needs_git
+def test_base_check_reports_a_removed_lock(tmp_path: Path):
+    repo, _ = _repo(tmp_path, {"main.py": STRICT_SRC})
+    (repo / "main.py").write_text("MAX = 999\n", encoding="utf-8")
+    result = CliRunner().invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert result.exit_code != 0
+    assert "LOCK REMOVED" in result.output
+
+
+@needs_git
+def test_base_check_rejects_weakening_the_mode(tmp_path: Path):
+    repo, _ = _repo(tmp_path, {"main.py": STRICT_SRC})
+    (repo / "main.py").write_text("# [LOCK: ast]\n# harmless?\nMAX = 5\n# [/LOCK]\n", encoding="utf-8")
+    result = CliRunner().invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert result.exit_code != 0
+    assert "MODE MISMATCH" in result.output
+
+
+@needs_git
+def test_base_check_lets_a_new_lock_in(tmp_path: Path):
+    repo, _ = _repo(tmp_path, {"main.py": STRICT_SRC})
+    (repo / "extra.py").write_text('# [LOCK: strict name="rate"]\nRATE = 2\n# [/LOCK]\n', encoding="utf-8")
+    result = CliRunner().invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert result.exit_code == 0
+    assert "NEW LOCK] extra.py#rate" in result.output
+
+
+@needs_git
+def test_base_check_runs_pbt_on_the_committed_code_not_on_keepout_json(tmp_path: Path):
+    """A logic lock executes the original. Under --base that is the base
+    commit's code; keepout.json's original_code is never run."""
+    marker = tmp_path / "ran.txt"
+    repo, _ = _repo(tmp_path, {"main.py": PBT_SRC})
+    _edit_db(repo / DEFAULT_DB_NAME, lambda data: data["locks"]["main.py#lock_0"].update(
+        original_code=f"open({str(marker)!r}, 'w').write('x')\ndef f(x):\n    return x * 3\n"
+    ))
+    (repo / "main.py").write_text(PBT_MOD, encoding="utf-8")
+    result = CliRunner().invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert result.exit_code != 0
+    assert "LOGIC VIOLATION" in result.output
+    assert not marker.exists()
+
+
+@needs_git
+def test_base_check_compares_with_the_branch_point(tmp_path: Path):
+    """A lock changed on main after the branch was cut is not the branch's
+    change: the baseline is the merge base, as in a pull request diff."""
+    repo, env = _repo(tmp_path, {"main.py": STRICT_SRC})
+    subprocess.run(["git", "switch", "-qc", "feature"], cwd=repo, env=env, check=True)
+    _commit(repo, env, {"notes.py": "x = 1\n"}, "feature work")
+    subprocess.run(["git", "switch", "-q", "main"], cwd=repo, env=env, check=True)
+    _commit(repo, env, {"main.py": "# [LOCK: strict]\n# UNLOCK_REASON: raise the cap\nMAX = 7\n# [/LOCK]\n"}, "raise cap")
+    subprocess.run(["git", "switch", "-q", "feature"], cwd=repo, env=env, check=True)
+
+    result = CliRunner().invoke(cli, ["check", "--base", "main", str(repo)])
+    assert result.exit_code == 0, result.output
+
+
+@needs_git
+def test_base_check_explains_a_ref_it_cannot_find(tmp_path: Path):
+    repo, _ = _repo(tmp_path, {"main.py": STRICT_SRC})
+    result = CliRunner().invoke(cli, ["check", "--base", "origin/main", str(repo)])
+    assert result.exit_code != 0
+    assert "fetch-depth" in result.output
+
+
+@needs_git
+def test_base_head_in_a_repository_without_commits_treats_every_lock_as_new(tmp_path: Path):
+    env = _plain_git_env(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    (repo / "main.py").write_text(STRICT_SRC, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True)
+    result = CliRunner().invoke(cli, ["check", "--staged", "--base", "HEAD", str(repo)])
+    assert result.exit_code == 0, result.output
+    assert "NEW LOCK" in result.output
+
+
+@needs_git
+def test_an_unlock_reason_already_in_the_baseline_does_not_unlock_the_next_change(tmp_path: Path):
+    """UNLOCK_REASON left in the code kept the region unlocked for every
+    later edit. It now unlocks only a change whose baseline does not carry
+    the same reason."""
+    unlocked_once = "# [LOCK: strict]\n# UNLOCK_REASON: raise the cap\nMAX = 7\n# [/LOCK]\n"
+    repo, _ = _repo(tmp_path, {"main.py": unlocked_once})
+    runner = CliRunner()
+
+    (repo / "main.py").write_text(unlocked_once.replace("MAX = 7", "MAX = 999"), encoding="utf-8")
+    for args in (["check", "--base", "HEAD", str(repo)], ["check", str(repo)]):
+        stale = runner.invoke(cli, args)
+        assert stale.exit_code != 0, args
+        assert "already in" in stale.output
+
+    (repo / "main.py").write_text(
+        unlocked_once.replace("MAX = 7", "MAX = 999").replace("raise the cap", "cap for the migration"),
+        encoding="utf-8",
+    )
+    fresh = runner.invoke(cli, ["check", "--base", "HEAD", str(repo)])
+    assert fresh.exit_code == 0
+    assert "UNLOCKED" in fresh.output

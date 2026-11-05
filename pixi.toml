@@ -1,6 +1,6 @@
 [workspace]
 name = "keepout"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight code protection CLI powered by Smart Syntax Locking and Property-Based Testing."
 authors = ["Shogo256"]
 channels = ["conda-forge"]
