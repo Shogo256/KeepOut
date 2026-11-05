@@ -20,11 +20,10 @@ pkgs.mkShell {
     tlaps
     j
     guile
-    pixi
   ];
 
   shellHook = ''
-    export PATH="$HOME/.pixi/bin:/usr/local/bin:$PATH"
+    export PATH="/usr/local/bin:$PATH"
 
     export CHPL_LLVM=none
     if [ -f "$HOME/chapel/util/setchplenv.bash" ]; then

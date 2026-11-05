@@ -75,14 +75,11 @@ keepout check .
 
 ---
 
-## 💻 2. Local Installation & Usage (Pip / Pixi)
+## 💻 2. Local Installation & Usage (Pip)
 
 ```bash
 # Install via pip
 pip install -e .
-
-# Or using Pixi
-pixi run pip install -e .
 ```
 
 KeepOut depends on `click` and on `tree-sitter` with its Go, JavaScript, TypeScript and Rust grammars, pinned to exact versions: a different grammar can change the hashes `keepout.json` records. `pip` installs them with KeepOut (prebuilt wheels for Linux, macOS and Windows). Without them KeepOut stops on a Go/JS/TS/Rust region rather than hash it another way.

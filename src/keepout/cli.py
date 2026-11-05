@@ -43,7 +43,7 @@ KEEPOUT_BANNER = r"""
 # Skipped by the directory walk used outside git. Inside a git work tree
 # .gitignore decides instead.
 IGNORED_DIRS: Set[str] = {
-    ".git", ".venv", "venv", ".pixi", "__pycache__", "node_modules", "build", "dist", "target",
+    ".git", ".venv", "venv", "__pycache__", "node_modules", "build", "dist", "target",
     "vendor", "coverage", ".idea", ".vscode",
 }
 
@@ -541,12 +541,10 @@ PRE_COMMIT_MARKER = "# KEEPOUT_PRE_COMMIT_HOOK"
 # through; a missing keepout now blocks it.
 PRE_COMMIT_SCRIPT_BLOCK = f"""{PRE_COMMIT_MARKER}
 echo "🔒 Running KeepOut pre-commit check on the staged content..."
-if command -v pixi >/dev/null 2>&1 && pixi run keepout --version >/dev/null 2>&1; then
-    pixi run keepout check --staged --base HEAD . || {{ echo "🚨 KeepOut pre-commit check failed! Commit blocked."; exit 1; }}
-elif command -v keepout >/dev/null 2>&1; then
+if command -v keepout >/dev/null 2>&1; then
     keepout check --staged --base HEAD . || {{ echo "🚨 KeepOut pre-commit check failed! Commit blocked."; exit 1; }}
 else
-    echo "🚨 keepout was not found in PATH or the pixi environment, so the locks were not checked. Commit blocked."
+    echo "🚨 keepout was not found in PATH, so the locks were not checked. Commit blocked."
     echo "   Install keepout, or run 'git commit --no-verify' to skip the check on purpose."
     exit 1
 fi
