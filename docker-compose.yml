@@ -1,7 +1,0 @@
-services:
-  keepout:
-    build: .
-    image: keepout:latest
-    volumes:
-      - .:/workspace
-    entrypoint: ["keepout"]

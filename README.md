@@ -57,25 +57,7 @@ KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renami
 
 ---
 
-## 🐳 1. Running with Docker (Recommended)
-
-No local setup required.
-
-```bash
-# Build Docker image
-docker build -t keepout .
-
-# Alias for native CLI execution
-alias keepout="docker run --rm -v \$(pwd):/workspace keepout"
-
-# Usage
-keepout init .
-keepout check .
-```
-
----
-
-## 💻 2. Local Installation & Usage (Pip)
+## 💻 Installation & Usage
 
 ```bash
 # Install a release (Python 3.10+)
