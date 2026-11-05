@@ -20,7 +20,7 @@ KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renami
 
 | Engine | Syntax Directive | How It Works | Cost | Ideal Use Case |
 | :--- | :--- | :--- | :--- | :--- |
-| **Smart Syntax Lock** *(Default)* | `# [LOCK]` or `# [LOCK: ast]` | **AST Alpha-Renaming & Structural Hash**. Ignores comments, whitespace, formatting, and renames of parameters and local variables (`x` ➔ `val`). Names visible outside the function — callees, builtins, globals, and the functions, classes and constants the region defines — must stay as written. Renames are recognised in Python only; other languages get a token hash that ignores comments and formatting. | Linear in region size (about 7 ms per 100 lines of Python) | Formatting & linting-heavy codebases where code structure must stay intact. |
+| **Smart Syntax Lock** *(Default)* | `# [LOCK]` or `# [LOCK: ast]` | **AST Alpha-Renaming & Structural Hash**. Ignores comments, whitespace, formatting, and renames of parameters and local variables (`x` ➔ `val`). Names visible outside the function — callees, builtins, globals, and the functions, classes and constants the region defines — must stay as written. Renames are recognised in Python, Go, JavaScript, TypeScript and Rust (the last four parsed with tree-sitter); other languages get a token hash that ignores comments and formatting. | Linear in region size (about 7 ms per 100 lines of Python) | Formatting & linting-heavy codebases where code structure must stay intact. |
 | **Deterministic PBT Sub-Engine** | `# [LOCK: pbt]` or `# [LOCK: logic]` | Calls **every top-level function** in the region with the same 10,000 reproducible argument sets, generated from each parameter's type hint, in the original and the edited version, and compares return values, raised exceptions and changes to the arguments. Python and Mojo only. | About 0.2–0.5 s per edited region (a separate Python process); at most 1 s per call and 60 s per region | Pure functions of numbers, strings, bools, dates, enums or containers of them, whose implementation may be refactored. |
 | **Strict Lock** | `# [LOCK: strict]` | SHA-256 exact byte hash matching. Rejects any edit including spaces or comments. | Linear in region size | Security constants, preventing re-occurrence of critical bugs. |
 
@@ -85,6 +85,8 @@ pip install -e .
 pixi run pip install -e .
 ```
 
+KeepOut depends on `click` and on `tree-sitter` with its Go, JavaScript, TypeScript and Rust grammars, pinned to exact versions: a different grammar can change the hashes `keepout.json` records. `pip` installs them with KeepOut (prebuilt wheels for Linux, macOS and Windows). Without them KeepOut stops on a Go/JS/TS/Rust region rather than hash it another way.
+
 ### CLI Commands
 
 ```bash
@@ -112,7 +114,8 @@ Directives must start a comment line (`#`, `//`, `/*`, `;`, `⍝` or `--`). The 
 | Kind | Files | Compared as (ast lock) |
 | :--- | :--- | :--- |
 | Python, Mojo | `.py`, `.mojo`, `.🔥` | AST; renames of parameters and locals ignored |
-| C family | `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.rs` `.go` `.java` `.js` `.jsx` `.ts` `.tsx` `.cs` `.kt` `.kts` `.swift` `.scala` `.proto` `.sol` `.v` `.sv` `.sac` | tokens; `//` and `/* */` comments and formatting ignored, preprocessor lines and strings kept |
+| Go, JS, TS, Rust | `.go` `.js` `.jsx` `.ts` `.tsx` `.rs` | structure via tree-sitter; comments, formatting and renames of parameters and locals ignored. A fragment that does not parse alone is parsed inside a function; one that still does not falls back to tokens |
+| C family | `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.java` `.cs` `.kt` `.kts` `.swift` `.scala` `.proto` `.sol` `.v` `.sv` `.sac` | tokens; `//` and `/* */` comments and formatting ignored, preprocessor lines and strings kept |
 | Shell | `.sh`, `.bash` | tokens; whitespace and line breaks kept |
 | Configuration | `.yaml` `.yml` (indentation and `key: v` spacing kept), `.toml`, `.tf` `.tfvars` `.hcl`, `.sql`, `Makefile` `*.mk`, `Dockerfile` `Dockerfile.*` `*.dockerfile` | tokens; the language's own comments ignored |
 | Others | `.s` `.asm` `.ll` `.llvm` `.scm` `.ss` `.lisp` `.clj` `.apl` `.ijs` | tokens |
@@ -170,7 +173,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "git+https://github.com/Shogo256/KeepOut@v0.4.0"
+      - run: pip install "git+https://github.com/Shogo256/KeepOut@v0.5.0"
       - run: keepout check --base "origin/${{ github.base_ref }}" --no-unlock
 ```
 
@@ -183,7 +186,7 @@ Make the job a required check, and put locked files and `keepout.json` under `CO
 - **Without `--base`, anyone who can write to the repository can re-lock.** `keepout init` records whatever the code is now, and plain `keepout check` trusts that record. Use `--base` in CI and the hook; it compares with git instead. Even then KeepOut fails a check — it cannot stop someone who can merge without it, or who deletes the CI job. Make the check required and review `keepout.json` and locked files through `CODEOWNERS`.
 - **Code outside the region.** Redefining a locked function later in the file, or monkeypatching it elsewhere, does not touch the region.
 - **PBT only sees what it can call.** Methods, functions taking your own classes, and values the generators do not produce (huge or deeply nested inputs, values the code never mentions) are not tested.
-- **Renames outside Python.** For other languages the ast lock compares tokens: comments and formatting are ignored, renaming a variable is a change.
+- **Renames outside Python, Go, JS, TS and Rust.** For the other languages the ast lock compares tokens: comments and formatting are ignored, renaming a variable is a change. In Go, JS, TS and Rust, destructuring shorthand (`const { base } = plan`, `Point { x }`) names a field as well as a variable, so renaming it is a change too.
 - **`keepout.json` from an older keepout.** A database written with a different hash format is refused; review the regions and run `keepout init`.
 
 ## 🛡️ Security notes

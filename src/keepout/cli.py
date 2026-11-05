@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple
+import functools
+
 import click
 
 from keepout import __version__
@@ -21,13 +23,14 @@ from keepout.core import (
     compute_ast_hash,
     language_of,
     load_locks_db,
-    python_ast_hash,
+    structural_hash,
     save_locks_db,
     sync_blocks_to_db,
     parse_file_locks,
     make_lock_key,
     property_based_test_equivalence,
 )
+from keepout.tsast import TreeSitterUnavailable
 
 KEEPOUT_BANNER = r"""
   🔒 _  _____ _____ _____   ____  _   _ _____ 
@@ -98,8 +101,23 @@ def cli():
     pass
 
 
+def _stops_without_tree_sitter(command):
+    """Ends the command with a message, not a traceback, when a region needs
+    a tree-sitter grammar that is not installed. Falling back to another
+    hash instead would record or compare hashes no full install produces."""
+    @functools.wraps(command)
+    def wrapper(*args, **kwargs):
+        try:
+            return command(*args, **kwargs)
+        except TreeSitterUnavailable as e:
+            click.echo(f"🚨 Error: {e}", err=True)
+            sys.exit(1)
+    return wrapper
+
+
 @cli.command(name="init")
 @click.argument("target_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path), default=".")
+@_stops_without_tree_sitter
 def init_cmd(target_dir: Path):
     """Scan source files and initialize/update keepout.json."""
     click.echo(KEEPOUT_BANNER)
@@ -244,6 +262,7 @@ def collect_blocks(root_dir: Path, use_git: bool = True) -> Dict[str, Tuple[str,
     "--no-unlock", "no_unlock", is_flag=True,
     help="Ignore UNLOCK_REASON comments, so an unlocked edit is checked like any other. For CI where automated agents can commit.",
 )
+@_stops_without_tree_sitter
 def check_cmd(target_dir: Path, staged: bool, base_ref: Optional[str], no_unlock: bool):
     """Check locked regions against keepout.json, or against git with --base."""
     click.echo(KEEPOUT_BANNER)
@@ -350,13 +369,13 @@ def check_block(
         return 1
 
     # Logic lock. An equal AST hash stands in for PBT only when it is a real
-    # Python AST hash: the token hash used for everything else is no proof
-    # of equal behaviour.
-    current_py_hash = python_ast_hash(block.content, ext)
+    # structural hash (Python, or tree-sitter for Go/JS/TS/Rust): the token
+    # hash used for everything else is no proof of equal behaviour.
+    current_structural = structural_hash(block.content, ext)
     if current_hash == baseline["strict_hash"]:
         click.echo(f"✅ [PASS] {key} (logic lock - unmodified text)")
         return 0
-    if current_py_hash is not None and current_py_hash == baseline["ast_hash"]:
+    if current_structural is not None and current_structural == baseline["ast_hash"]:
         click.echo(f"✅ [PASS] {key} (logic lock - AST structural match)")
         return 0
     if unlock_reason:

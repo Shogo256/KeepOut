@@ -1202,3 +1202,98 @@ def test_only_the_files_own_comment_syntax_unlocks(tmp_path: Path):
     unlocked = runner.invoke(cli, ["check", str(tmp_path)])
     assert unlocked.exit_code == 0
     assert "UNLOCKED" in unlocked.output
+
+
+# =====================================================================
+# 14. Go, JavaScript, TypeScript and Rust: structure via tree-sitter
+# =====================================================================
+
+_GO = "func Total(items []int) int {\n\tsum := 0\n\tfor _, v := range items {\n\t\tsum += v\n\t}\n\treturn sum\n}\n"
+_TS = "export function price(plan: Plan, qty: number): number {\n  const unit = plan.base; // per item\n  return Math.max(unit * qty, 0);\n}\n"
+_JS = "export const total = (items) => {\n  let sum = 0;\n  for (const item of items) { sum += item.price; }\n  return sum;\n};\n"
+_RS = "fn total(items: &[u64]) -> u64 {\n    let mut sum = 0;\n    for v in items { sum += v; }\n    sum\n}\n"
+
+
+@pytest.mark.parametrize(
+    "original, modified, lang",
+    [
+        (_GO, "func Total(xs []int) int { s := 0; for _, x := range xs { s += x }; return s }", "go"),
+        (_TS, "export function price(p: Plan, q: number): number { const u = p.base\n return Math.max(u * q, 0) }", "ts"),
+        (_JS, "export const total = (xs) => { let s = 0\n for (const x of xs) { s += x.price }\n return s }", "js"),
+        (_RS, "fn total(xs: &[u64]) -> u64 { let mut s = 0; for x in xs { s += x; } s }", "rs"),
+        ("fn f(o: Option<u8>) -> u8 { match o { Some(v) => v, None => 0 } }",
+         "fn f(o: Option<u8>) -> u8 { match o { Some(n) => n, None => 0 } }", "rs"),
+        ("    let fee = amt / 10;\n    fee + 1", "    let f = amt / 10;\n    f + 1", "rs"),
+        ("func f(x int) P { X := x; return P{X: X} }", "func f(x int) P { Y := x; return P{X: Y} }", "go"),
+    ],
+    ids=["go", "ts", "js", "rust", "rust-match-binding", "rust-fragment", "go-field-key"],
+)
+def test_renaming_locals_and_reformatting_is_not_a_change(original: str, modified: str, lang: str):
+    """Go, JS, TS and Rust were compared token by token, so renaming a local
+    variable was a violation. They now get a structural hash that renames
+    only what a function declares."""
+    assert compute_ast_hash(original, lang) == compute_ast_hash(modified, lang)
+
+
+@pytest.mark.parametrize(
+    "original, modified, lang",
+    [
+        ("func f(a, b int) int { return max(a, b) }", "func f(a, b int) int { return min(a, b) }", "go"),
+        (_GO, _GO.replace("Total", "Sum"), "go"),
+        (_GO, _GO.replace("sum += v", "sum -= v"), "go"),
+        (_TS, _TS.replace("Math.max", "Math.min"), "ts"),
+        (_TS, _TS.replace("plan.base", "plan.cost"), "ts"),
+        ("function send(to, body) { mail(to, body) }", "function send(to, body) { mail(body, to) }", "js"),
+        (_RS, _RS.replace("    sum\n}", "    sum;\n}"), "rs"),
+        ("fn f(a: u64, b: u64) -> u64 { std::cmp::max(a, b) }", "fn f(a: u64, b: u64) -> u64 { std::cmp::min(a, b) }", "rs"),
+        ("    let fee = amt / 10;\n    fee + 1", "    let fee = cost / 10;\n    fee + 1", "rs"),
+    ],
+    ids=["go-builtin", "go-function-name", "go-operator", "ts-callee", "ts-property", "js-argument-order",
+         "rust-trailing-semicolon", "rust-path", "rust-free-variable"],
+)
+def test_changes_that_matter_are_still_changes(original: str, modified: str, lang: str):
+    assert compute_ast_hash(original, lang) != compute_ast_hash(modified, lang)
+
+
+def test_a_go_ast_lock_accepts_a_rename_and_rejects_a_callee_swap(tmp_path: Path):
+    src = "// [LOCK: ast name=\"total\"]\n" + _GO + "// [/LOCK]\n"
+    renamed = src.replace("sum", "acc").replace("v", "x").replace("items", "xs")
+    runner, _ = _init_then_edit(tmp_path, src, renamed, name="total.go")
+    assert runner.invoke(cli, ["check", str(tmp_path)]).exit_code == 0
+
+    (tmp_path / "total.go").write_text(src.replace("sum += v", "sum += max(v, 0)"), encoding="utf-8")
+    result = runner.invoke(cli, ["check", str(tmp_path)])
+    assert result.exit_code != 0
+    assert "AST STRUCTURAL VIOLATION" in result.output
+
+
+def test_without_tree_sitter_the_check_stops_with_a_reason(tmp_path: Path, monkeypatch):
+    """Hashing a Go region some other way when tree-sitter is missing would
+    record hashes a full install never produces; the command stops instead."""
+    from keepout import tsast
+    monkeypatch.setitem(sys.modules, "tree_sitter_go", None)
+    tsast._parser.cache_clear()
+    try:
+        (tmp_path / "total.go").write_text("// [LOCK: ast]\n" + _GO + "// [/LOCK]\n", encoding="utf-8")
+        result = CliRunner().invoke(cli, ["init", str(tmp_path)])
+        assert result.exit_code != 0
+        assert "tree-sitter" in result.output
+        assert not (tmp_path / DEFAULT_DB_NAME).exists()
+    finally:
+        tsast._parser.cache_clear()
+
+
+def test_a_logic_lock_on_go_passes_a_rename_on_structure_alone(tmp_path: Path):
+    """There is no PBT engine for Go, so a logic lock on it could pass only
+    unchanged text. A tree-sitter structural match is proof enough for a
+    pure rename; any other change is still unverifiable, which fails."""
+    src = "// [LOCK: pbt]\n" + _GO + "// [/LOCK]\n"
+    runner, _ = _init_then_edit(tmp_path, src, src.replace("sum", "acc"), name="total.go")
+    renamed = runner.invoke(cli, ["check", str(tmp_path)])
+    assert renamed.exit_code == 0
+    assert "AST structural match" in renamed.output
+
+    (tmp_path / "total.go").write_text(src.replace("sum += v", "sum += v * 2"), encoding="utf-8")
+    changed = runner.invoke(cli, ["check", str(tmp_path)])
+    assert changed.exit_code != 0
+    assert "UNVERIFIABLE" in changed.output

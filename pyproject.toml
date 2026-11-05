@@ -4,12 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepout"
-version = "0.4.0"
+version = "0.5.0"
 description = "Lightweight code protection CLI powered by Smart Syntax Locking and Property-Based Testing."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0.0",
+    # Pinned exactly: a different grammar can change the hashes keepout.json
+    # records (see keepout.tsast.ENGINE).
+    "tree-sitter==0.26.0",
+    "tree-sitter-go==0.25.0",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+    "tree-sitter-rust==0.24.2",
 ]
 
 [project.scripts]

@@ -18,6 +18,7 @@ import textwrap
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from keepout.inputs import NoStrategy, argument_sets, mine_literals
+from keepout.tsast import TREE_SITTER_LANGS, tree_sitter_hash
 
 
 # =====================================================================
@@ -240,7 +241,9 @@ DEFAULT_DB_NAME = "keepout.json"
 # languages get a token hash that keeps preprocessor lines, strings and
 # meaningful whitespace; named locks are keyed by name. Records written by
 # 2.0.0 are not comparable with these.
-VERSION = "2.1.0"
+# 2.2.0: Go, JavaScript, TypeScript and Rust regions get a tree-sitter
+# structural hash (keepout.tsast) instead of the token hash.
+VERSION = "2.2.0"
 
 KNOWN_MODES = {"strict", "ast", "default", "pbt", "logic"}
 MODE_ALIASES = {"default": "ast", "logic": "pbt"}
@@ -620,9 +623,23 @@ def compute_ast_hash(content: str, lang: str = "py") -> str:
         digest = python_ast_hash(content, lang)
     elif lang in ("mojo", "🔥"):
         digest = _normalized_ast_digest(_mojo_to_python(content))
+    elif lang in TREE_SITTER_LANGS:
+        digest = tree_sitter_hash(content, lang)
     if digest is not None:
         return digest
     return _token_fallback_digest(content, lang)
+
+
+def structural_hash(content: str, lang: str) -> Optional[str]:
+    """A hash that proves "the same code up to comments, formatting and local
+    renames" -- Python's AST, or tree-sitter's for Go, JS, TS and Rust -- or
+    None when the region is in another language or does not parse."""
+    lang = lang.lower().lstrip(".")
+    if lang in ("py", "python"):
+        return python_ast_hash(content, lang)
+    if lang in TREE_SITTER_LANGS:
+        return tree_sitter_hash(content, lang)
+    return None
 
 
 class LockDatabaseError(Exception):
