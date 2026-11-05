@@ -30,9 +30,9 @@ KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renami
 
 ```
 [ Original Code ]  ──┐
-                     ├──> [ Python AST Alpha-Renaming ] ──> Match? ➔ PASS ✨ (Python regions only)
+                     ├──> [ Structural Hash ] ──> Match? ➔ PASS ✨ (Python, Go, JS, TS, Rust)
 [ Modified Code ]  ──┘                   │
- (Local renames,                         └── Mismatch, or not Python
+ (Local renames,                         └── Mismatch, or another language
   comments, formatting                             │
   ignored automatically)                           ▼
                                      [ 1. Re-try Cached Counterexamples ] (keepout.json)
@@ -78,9 +78,14 @@ keepout check .
 ## 💻 2. Local Installation & Usage (Pip)
 
 ```bash
-# Install via pip
-pip install -e .
+# Install a release (Python 3.10+)
+pip install https://github.com/Shogo256/KeepOut/releases/download/v0.5.0/keepout-0.5.0-py3-none-any.whl
+
+# or from the tag
+pip install "git+https://github.com/Shogo256/KeepOut@v0.5.0"
 ```
+
+Do not `pip install keepout`: that name on PyPI belongs to an unrelated project. `check --base`, `check --staged` and the pre-commit hook also need `git`.
 
 KeepOut depends on `click` and on `tree-sitter` with its Go, JavaScript, TypeScript and Rust grammars, pinned to exact versions: a different grammar can change the hashes `keepout.json` records. `pip` installs them with KeepOut (prebuilt wheels for Linux, macOS and Windows). Without them KeepOut stops on a Go/JS/TS/Rust region rather than hash it another way.
 
@@ -94,7 +99,7 @@ keepout init
 keepout check
 
 # Verify against the code at the branch point with main, read from git
-# (what CI should run; see "Checking in CI" below)
+# (what CI should run; see "Checking in CI" below). Needs no keepout.json.
 keepout check --base origin/main
 
 # Install Git Pre-commit hook
@@ -196,8 +201,12 @@ Make the job a required check, and put locked files and `keepout.json` under `CO
 ## 🧪 Running Tests
 
 ```bash
+# From a checkout: install KeepOut with its dependencies, then pytest
+pip install -e . pytest
 pytest
 ```
+
+The hook and `--base` tests need `git`; they are skipped without it.
 
 ---
 
