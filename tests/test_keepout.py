@@ -1121,3 +1121,84 @@ def test_classes_the_region_defines_compare_by_name_and_content(original: str, m
     of code using its own enum, dataclass or exception failed."""
     result = property_based_test_equivalence(original, modified, lang="py", **PBT_FAST)
     assert result.status_str == status, result.message
+
+
+# =====================================================================
+# 13. Configuration and infrastructure files; scanning what git tracks
+# =====================================================================
+
+@pytest.mark.parametrize(
+    "original, modified, lang",
+    [
+        ("env:\n  - name: A\ndebug: true\n", "env:\n  - name: A\n  debug: true\n", "yaml"),
+        ("retries: 3\n", "retries:3\n", "yml"),
+        ("url: http://x/#frag\n", "url: http://x/#other\n", "yaml"),
+        ("timeout = 30\n", "timeout = 300\n", "toml"),
+        ('ingress { cidr_blocks = ["10.0.0.0/8"] }\n', 'ingress { cidr_blocks = ["0.0.0.0/0"] }\n', "tf"),
+        ("SELECT * FROM orders WHERE tenant_id = :tid;\n", "SELECT * FROM orders WHERE 1 = 1;\n", "sql"),
+        ("RUN rm -rf /tmp/build\n", "RUN rm -rf / tmp/build\n", "dockerfile"),
+        ("RUN echo #a\n", "RUN echo #b\n", "dockerfile"),
+        ("deploy:\n\t./deploy.sh --dry-run\n", "deploy:\n\t./deploy.sh\n", "make"),
+    ],
+    ids=["yaml-nesting", "yaml-mapping-space", "yaml-hash-in-value", "toml", "terraform", "sql",
+         "dockerfile-space", "dockerfile-hash-mid-line", "make"],
+)
+def test_configuration_changes_are_changes(original: str, modified: str, lang: str):
+    assert compute_ast_hash(original, lang) != compute_ast_hash(modified, lang)
+
+
+@pytest.mark.parametrize(
+    "original, modified, lang",
+    [
+        ("env:\n  - name: A\n", "# vars\nenv:\n\n  - name: A   # first\n", "yaml"),
+        ("timeout = 30 # s\n", "timeout = 30 # seconds\n", "toml"),
+        ('a = 1\nb = "x"\n', '# one\na = 1 // still one\n/* b */ b = "x"\n', "tf"),
+        ("SELECT 1;\n", "-- check\nSELECT /* one */ 1;\n", "sql"),
+        ("FROM python:3.12\nRUN make\n", "# base image\nFROM python:3.12\n\n  # build\nRUN make\n", "dockerfile"),
+        ("deploy:\n\t./deploy.sh\n", "# ship it\ndeploy:\n\t./deploy.sh  # go\n", "make"),
+    ],
+    ids=["yaml", "toml", "terraform", "sql", "dockerfile", "make"],
+)
+def test_configuration_comments_are_not_changes(original: str, modified: str, lang: str):
+    assert compute_ast_hash(original, lang) == compute_ast_hash(modified, lang)
+
+
+@pytest.mark.parametrize(
+    "name, text",
+    [
+        ("Makefile", "# [LOCK: strict name=\"deploy\"]\ndeploy:\n\t./deploy.sh\n# [/LOCK]\n"),
+        ("Dockerfile.prod", "# [LOCK: strict]\nUSER app\n# [/LOCK]\n"),
+        ("compose.yml", "# [LOCK: ast]\nports:\n  - \"127.0.0.1:8181:8181\"\n# [/LOCK]\n"),
+        ("schema.sql", "-- [LOCK: strict]\nCREATE POLICY tenant ON orders USING (tenant_id = current_tenant());\n-- [/LOCK]\n"),
+        ("main.tf", "# [LOCK: strict]\nresource \"x\" \"y\" {}\n# [/LOCK]\n"),
+    ],
+)
+def test_locks_in_configuration_files_are_found(tmp_path: Path, name: str, text: str):
+    (tmp_path / name).write_text(text, encoding="utf-8")
+    result = CliRunner().invoke(cli, ["init", str(tmp_path)])
+    assert result.exit_code == 0
+    assert f"{name}#" in result.output
+
+
+@needs_git
+def test_files_gitignore_excludes_are_not_scanned(tmp_path: Path):
+    repo, env = _repo(tmp_path, {".gitignore": "generated/\n"}, init=False)
+    (repo / "generated").mkdir()
+    (repo / "generated" / "out.py").write_text("# [LOCK]\nx = 1\n# [/LOCK]\n", encoding="utf-8")
+    (repo / "new.py").write_text("# [LOCK]\ny = 2\n# [/LOCK]\n", encoding="utf-8")
+    result = CliRunner().invoke(cli, ["init", str(repo)])
+    assert "new.py#lock_0" in result.output  # untracked but not ignored
+    assert "generated/out.py" not in result.output
+
+
+def test_only_the_files_own_comment_syntax_unlocks(tmp_path: Path):
+    """`; UNLOCK_REASON: x` is an empty statement and a label in C -- code
+    that runs -- and it unlocked the region because ';' is a comment in Lisp."""
+    src = "// [LOCK: strict]\nint max = 5;\n// [/LOCK]\n"
+    runner, _ = _init_then_edit(tmp_path, src, "// [LOCK: strict]\n; UNLOCK_REASON: x\nint max = 999;\n// [/LOCK]\n", name="limits.c")
+    assert runner.invoke(cli, ["check", str(tmp_path)]).exit_code != 0
+
+    (tmp_path / "limits.c").write_text("// [LOCK: strict]\n// UNLOCK_REASON: raise for the migration\nint max = 999;\n// [/LOCK]\n", encoding="utf-8")
+    unlocked = runner.invoke(cli, ["check", str(tmp_path)])
+    assert unlocked.exit_code == 0
+    assert "UNLOCKED" in unlocked.output

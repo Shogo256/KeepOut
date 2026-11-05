@@ -39,16 +39,36 @@ class LockBlock:
     lock_id: str = ""
 
 
-_COMMENT_PREFIX = r'(?:#|//|/\*|;|⍝)'
+_COMMENT_PREFIX = r'(?:#|//|/\*|;|⍝|--)'
 # Directives must open a comment line. Matched anywhere in a line, a string
 # such as print("# [LOCK]") opened a lock.
 LOCK_START_PATTERN = re.compile(
     rf'^\s*(?P<comment_prefix>{_COMMENT_PREFIX})\s*\[LOCK(?:\s*:\s*(?P<mode>[A-Za-z]+))?(?P<attrs>[^\]]*)\](?P<comment_suffix>.*)'
 )
 LOCK_END_PATTERN = re.compile(rf'^\s*{_COMMENT_PREFIX}\s*\[/LOCK\]')
-# Only a comment line unlocks. Matched anywhere, UNLOCK_REASON: inside a
-# string literal unlocked the region.
-UNLOCK_REASON_PATTERN = re.compile(rf'^\s*(?:{_COMMENT_PREFIX}|\*)\s*UNLOCK_REASON:\s*(?P<reason>.+)')
+# Only a comment line unlocks, in the file's own comment syntax. Matched
+# anywhere, UNLOCK_REASON: inside a string literal unlocked the region; with
+# one set of markers for every language, `; UNLOCK_REASON: x` -- an empty
+# statement and a label in C, code that runs -- unlocked it too.
+@functools.lru_cache(maxsize=None)
+def _unlock_pattern(lang: str) -> "re.Pattern[str]":
+    rules = _TOKEN_RULES.get(lang, _C_LIKE)
+    markers = list(rules.line_comments) + list(rules.line_start_comments) + [o for o, _ in rules.block_comments]
+    alternatives = "|".join(re.escape(m) for m in markers)
+    if rules.block_comments:
+        alternatives += r"|\*"  # a continuation line inside /* ... */
+    return re.compile(rf'^\s*(?:{alternatives})\s*UNLOCK_REASON:\s*(?P<reason>.+)')
+
+
+def language_of(path: Path) -> str:
+    """The language key for a file: its extension, or its name for files
+    that have none (Makefile, Dockerfile)."""
+    name = path.name.lower()
+    if name in ("makefile", "gnumakefile") or name.endswith(".mk"):
+        return "make"
+    if name in ("dockerfile", "containerfile") or name.startswith("dockerfile.") or name.endswith(".dockerfile"):
+        return "dockerfile"
+    return path.suffix.lower().lstrip(".")
 DIRECTIVE_UNLOCK_PATTERN = re.compile(r'UNLOCK_REASON:\s*(?P<reason>.+)')
 ATTR_PATTERN = re.compile(r'(?P<key>\w+)\s*=\s*(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')')
 KNOWN_ATTRS = {"name", "target_symbol"}
@@ -109,9 +129,17 @@ def parse_file_locks(file_path: Path) -> List[LockBlock]:
         return []
 
     try:
-        raw_text = file_path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, PermissionError):
+        data = file_path.read_bytes()
+    except (OSError, PermissionError):
         return []
+    # Most files have no lock: skip decoding and parsing them.
+    if b"[LOCK" not in data and b"[/LOCK" not in data:
+        return []
+    try:
+        raw_text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    unlock_pattern = _unlock_pattern(language_of(file_path))
 
     lines = raw_text.replace("\r\n", "\n").split("\n")
     blocks: List[LockBlock] = []
@@ -187,7 +215,7 @@ def parse_file_locks(file_path: Path) -> List[LockBlock]:
             in_lock = False
 
         elif in_lock:
-            reason_match = UNLOCK_REASON_PATTERN.search(line)
+            reason_match = unlock_pattern.search(line)
             if reason_match:
                 current_unlock_reason = _clean_reason(reason_match.group("reason"))
             current_lines.append(line)
@@ -478,6 +506,7 @@ class _TokenRules:
     newlines: str = "never"  # "never", "always", or "directives" (C preprocessor lines)
     spaces: bool = False  # whitespace between tokens on a line matters (shell)
     indentation: bool = False  # leading whitespace matters (Python-like)
+    line_start_comments: Tuple[str, ...] = ()  # comments only as the first thing on a line (Dockerfile)
 
 
 _C_LIKE = _TokenRules(newlines="directives")
@@ -500,12 +529,30 @@ _TOKEN_RULES: Dict[str, _TokenRules] = {
     **{ext: _TokenRules(line_comments=(";", "//"), newlines="always") for ext in ("s", "asm")},
     "apl": _TokenRules(line_comments=("⍝",), block_comments=(), quotes=("'",), newlines="always"),
     "ijs": _TokenRules(line_comments=("NB.",), block_comments=(), quotes=("'",), newlines="always"),
+    **{ext: _C_LIKE for ext in ("cs", "proto")},
+    **{ext: _TokenRules(quotes=('"""', '"', "'"), newlines="directives") for ext in ("kt", "kts", "swift", "scala")},
+    # YAML: `key: v` is a mapping and `key:v` a string, and nesting is
+    # indentation, so both kinds of whitespace count.
+    **{ext: _TokenRules(line_comments=("#",), block_comments=(), newlines="always", spaces=True, indentation=True)
+       for ext in ("yaml", "yml")},
+    "toml": _TokenRules(line_comments=("#",), block_comments=(), quotes=('"""', "'''", '"', "'"), newlines="always"),
+    **{ext: _TokenRules(line_comments=("#", "//"), newlines="always") for ext in ("tf", "tfvars", "hcl")},
+    "sql": _TokenRules(line_comments=("--",)),
+    # Make: a recipe line must start with a tab, and recipes are shell.
+    "make": _TokenRules(line_comments=("#",), block_comments=(), newlines="always", spaces=True, indentation=True),
+    # Dockerfile: '#' is a comment only at the start of a line; `RUN echo #x`
+    # passes "#x" on.
+    "dockerfile": _TokenRules(line_comments=(), line_start_comments=("#",), block_comments=(),
+                              newlines="always", spaces=True),
 }
 
 
 @functools.lru_cache(maxsize=None)
 def _token_scanner(rules: _TokenRules) -> "re.Pattern[str]":
-    parts = [r"(?P<nl>\n)", r"(?P<ws>[^\S\n]+)"]
+    parts = [r"(?P<nl>\n)"]
+    for marker in rules.line_start_comments:
+        parts.append(rf"(?P<line{len(parts)}>(?<![^\n])[ \t]*{re.escape(marker)}[^\n]*)")
+    parts.append(r"(?P<ws>[^\S\n]+)")
     for open_, close in rules.block_comments:
         parts.append(rf"(?P<block{len(parts)}>{re.escape(open_)}.*?{re.escape(close)})")
     for marker in rules.line_comments:
@@ -660,7 +707,7 @@ def sync_blocks_to_db(db_path: Path, blocks: List[LockBlock], root_dir: Path) ->
 
         key = make_lock_key(rel_path, block.lock_id)
         content_hash = compute_strict_hash(block.content)
-        ext = block.file_path.suffix.lstrip(".")
+        ext = language_of(block.file_path)
         ast_hash = compute_ast_hash(block.content, lang=ext)
 
         cached_ces = existing_locks.get(key, {}).get("cached_counterexamples", [])

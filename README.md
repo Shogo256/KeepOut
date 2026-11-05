@@ -106,7 +106,18 @@ keepout install-hook
 
 ## 📜 Directive Syntax Protocol
 
-Directives must start a comment line (`#`, `//`, `/*`, `;` or `⍝`). The mode is one of `strict`, `ast`, `pbt` or `logic`; anything else is an error rather than a silent fallback to `ast`.
+Directives must start a comment line (`#`, `//`, `/*`, `;`, `⍝` or `--`). The mode is one of `strict`, `ast`, `pbt` or `logic`; anything else is an error rather than a silent fallback to `ast`.
+
+### 📂 Files KeepOut reads
+| Kind | Files | Compared as (ast lock) |
+| :--- | :--- | :--- |
+| Python, Mojo | `.py`, `.mojo`, `.🔥` | AST; renames of parameters and locals ignored |
+| C family | `.c` `.h` `.cpp` `.cc` `.cxx` `.hpp` `.rs` `.go` `.java` `.js` `.jsx` `.ts` `.tsx` `.cs` `.kt` `.kts` `.swift` `.scala` `.proto` `.sol` `.v` `.sv` `.sac` | tokens; `//` and `/* */` comments and formatting ignored, preprocessor lines and strings kept |
+| Shell | `.sh`, `.bash` | tokens; whitespace and line breaks kept |
+| Configuration | `.yaml` `.yml` (indentation and `key: v` spacing kept), `.toml`, `.tf` `.tfvars` `.hcl`, `.sql`, `Makefile` `*.mk`, `Dockerfile` `Dockerfile.*` `*.dockerfile` | tokens; the language's own comments ignored |
+| Others | `.s` `.asm` `.ll` `.llvm` `.scm` `.ss` `.lisp` `.clj` `.apl` `.ijs` | tokens |
+
+Inside a git work tree KeepOut reads the tracked files and the untracked ones `.gitignore` does not exclude, so generated code and dependencies are skipped; outside git it walks the directory and skips `node_modules`, `vendor`, `build`, `dist`, `target`, virtual environments and dot-directories. Files without a `[LOCK` are not parsed.
 
 ### 🌿 Smart Syntax Lock (Default: Structure Fixed, Formatting & Local Renames Ignored)
 ```python
@@ -137,7 +148,7 @@ const int MAX_RETRY_COUNT = 5;
 `name="..."` (letters, digits, `_`, `.`, `-`) is the lock's identity in `keepout.json`: `src/app.py#calc`. Unnamed locks are numbered among the unnamed locks of their file (`src/app.py#lock_0`), so adding an unnamed lock above them shifts their keys. Name every lock you expect to keep.
 
 ### 🔓 Unlocking on purpose
-A comment line `UNLOCK_REASON: <why>` inside the region (or after the `[LOCK]` directive on its line) lets one edit pass, reported as `UNLOCKED`. A reason the baseline already carries — the same text in `keepout.json` or in the `--base` commit — does not unlock again: the next change needs a new reason. Anyone who can edit the file can add one, an AI agent included. In CI where agents can commit, run `keepout check --no-unlock` so unlock comments are ignored. After an unlocked change, run `keepout init` to record the new code.
+A comment line `UNLOCK_REASON: <why>` — written with the file's own comment syntax — inside the region (or after the `[LOCK]` directive on its line) lets one edit pass, reported as `UNLOCKED`. A reason the baseline already carries — the same text in `keepout.json` or in the `--base` commit — does not unlock again: the next change needs a new reason. Anyone who can edit the file can add one, an AI agent included. In CI where agents can commit, run `keepout check --no-unlock` so unlock comments are ignored. After an unlocked change, run `keepout init` to record the new code.
 
 ### 🪝 Pre-commit hook
 `keepout install-hook` adds a block that runs `keepout check --staged --base HEAD`: the content being committed, not the files on disk, compared with the last commit as git has it. A locked region changed in the commit fails even if the same commit re-records it in `keepout.json`. The hook blocks the commit when keepout cannot be found; `git commit --no-verify` skips it deliberately. Re-run `install-hook` after upgrading to replace an older block.
@@ -159,7 +170,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "git+https://github.com/Shogo256/KeepOut@v0.2.0"
+      - run: pip install "git+https://github.com/Shogo256/KeepOut@v0.4.0"
       - run: keepout check --base "origin/${{ github.base_ref }}" --no-unlock
 ```
 
