@@ -130,19 +130,11 @@ def test_cli_smart_syntax_lock_mode(tmp_path: Path):
     assert "AST STRUCTURAL VIOLATION" in res_fail.output
 
 
-def test_a_region_the_engine_cannot_call_is_not_a_pass():
-    """The PBT engine calls the target with one integer argument and execs
-    the region in an empty namespace. A function taking several arguments, or
-    reading a module-level name, raises on every generated input.
-
-    Those raises are skipped, which is right for a function that rejects some
-    inputs. It used to be the only behaviour, so a function that could not be
-    called at all ended the loop having compared nothing and was reported as
-    passing -- including when its body was replaced wholesale.
-
-    A check that cannot fail is worse than no check: an absent lock is
-    visible, and a green one is not.
-    """
+def test_a_function_of_several_arguments_is_compared_not_skipped():
+    """The engine used to call every function with one integer, so a
+    function of three arguments raised TypeError on every call. That was
+    first reported as a pass, then as unverifiable. Arguments now come from
+    the parameters (int where unannotated), so gutting it is a mismatch."""
     original = (
         "FLOOR = 0.5\n"
         "def verdict(share, ceiling, sampled):\n"
@@ -156,10 +148,24 @@ def test_a_region_the_engine_cannot_call_is_not_a_pass():
         "    return 'yes'\n"
     )
     result = property_based_test_equivalence(original, gutted, lang="py")
+    assert result.status_str == "pbt_fail"
+    assert "verdict(" in result.message
+
+
+def test_a_function_the_engine_cannot_call_is_not_a_pass():
+    """A check that cannot fail is worse than no check: an absent lock is
+    visible, and a green one is not. A parameter of a type with no generator
+    leaves the function uncalled, and a change to it unverifiable."""
+    original = (
+        "class Shape:\n    def __init__(self, w):\n        self.w = w\n"
+        "def area(s: Shape) -> int:\n    return s.w * s.w\n"
+    )
+    gutted = original.replace("return s.w * s.w", "return 0")
+    result = property_based_test_equivalence(original, gutted, lang="py")
     assert not result.is_equivalent
     assert result.status_str == "pbt_unverifiable"
-    assert "verified nothing" in result.message or "Nothing was verified" in result.message
-    assert "TypeError" in result.message
+    assert "Nothing was verified" in result.message
+    assert "Shape" in result.message
 
 
 def test_a_language_with_no_engine_is_not_a_pass():
@@ -521,21 +527,24 @@ def test_pbt_tests_every_function_the_region_defines(original: str, modified: st
 
 
 def test_a_helper_pbt_cannot_call_is_fine_only_while_it_is_unchanged():
-    helper = "def _fmt(a, b):\n    return f'{a}:{b}'\n"
+    helper = (
+        "class Box:\n    def __init__(self, v):\n        self.v = v\n"
+        "def _label(b: Box) -> str:\n    return f'box:{b.v}'\n"
+    )
     unchanged = property_based_test_equivalence(
-        helper + "def f(x):\n    return _fmt(x, 1)\n",
-        helper + "def f(y):\n    out = _fmt(y, 1)\n    return out\n",
+        helper + "def f(x):\n    return x * 2\n",
+        helper + "def f(y):\n    out = y + y\n    return out\n",
         lang="py", **PBT_FAST,
     )
     assert unchanged.status_str == "pbt_pass"
 
     changed = property_based_test_equivalence(
         helper + "def f(x):\n    return x\n",
-        "def _fmt(a, b):\n    return f'{b}:{a}'\ndef f(x):\n    return x\n",
+        helper.replace("box:", "BOX:") + "def f(x):\n    return x\n",
         lang="py", **PBT_FAST,
     )
     assert changed.status_str == "pbt_unverifiable"
-    assert "_fmt" in changed.message
+    assert "_label" in changed.message
 
 
 def test_a_region_that_exits_does_not_end_the_check(tmp_path: Path):
@@ -999,3 +1008,116 @@ def test_an_unlock_reason_already_in_the_baseline_does_not_unlock_the_next_chang
     fresh = runner.invoke(cli, ["check", "--base", "HEAD", str(repo)])
     assert fresh.exit_code == 0
     assert "UNLOCKED" in fresh.output
+
+
+# =====================================================================
+# 12. PBT arguments come from the parameters' types
+# =====================================================================
+
+@pytest.mark.parametrize(
+    "original, modified",
+    [
+        ("def add(a: int, b: int) -> int:\n    return a + b", "def add(a: int, b: int) -> int:\n    return a - b"),
+        ("def slug(s: str) -> str:\n    return s.strip().lower()", "def slug(s: str) -> str:\n    return s.lower()"),
+        (
+            "def tier(code: str) -> str:\n    return 'gold' if code == 'VIP' else 'std'",
+            "def tier(code: str) -> str:\n    return 'gold' if code == 'vip' else 'std'",
+        ),
+        ("def third(x: float) -> float:\n    return x / 3", "def third(x: float) -> float:\n    return x * 0.3333"),
+        (
+            "def fee(amount: int, *, member: bool) -> int:\n    return amount // 2 if member else amount",
+            "def fee(amount: int, *, member: bool) -> int:\n    return amount // 2 if not member else amount",
+        ),
+        (
+            "def name(n: str | None) -> str:\n    return n if n is not None else 'anon'",
+            "def name(n: str | None) -> str:\n    return n or 'anon'",
+        ),
+        (
+            "from typing import Literal\ndef price(plan: Literal['basic', 'pro']) -> int:\n    return 10 if plan == 'basic' else 30",
+            "from typing import Literal\ndef price(plan: Literal['basic', 'pro']) -> int:\n    return 10 if plan == 'pro' else 30",
+        ),
+        ("def limit():\n    return 5", "def limit():\n    return 6"),
+    ],
+    ids=["two-ints", "str", "str-literal", "float", "keyword-only-bool", "optional", "literal", "no-arguments"],
+)
+def test_pbt_calls_functions_with_arguments_of_their_types(original: str, modified: str):
+    """Every function used to get one int. A function of two ints, of a
+    string, of a float or of nothing at all raised TypeError on every call,
+    and a change to it could not be seen."""
+    result = property_based_test_equivalence(original, modified, lang="py", **PBT_FAST)
+    assert result.status_str == "pbt_fail", result.message
+
+
+def test_pbt_compares_what_a_function_does_to_its_arguments():
+    result = property_based_test_equivalence(
+        "def push(xs: list[int], v: int) -> None:\n    xs.append(v)",
+        "def push(xs: list[int], v: int) -> None:\n    xs.insert(0, v)",
+        lang="py", **PBT_FAST,
+    )
+    assert result.status_str == "pbt_fail"
+    assert "Arguments after the call" in result.message
+
+
+@pytest.mark.parametrize(
+    "original, modified",
+    [
+        ("def half(x: float) -> float:\n    return x / 2", "def half(x: float) -> float:\n    return x * 0.5"),
+        ("def same(x: float) -> float:\n    return x * 1.0", "def same(y: float) -> float:\n    return y + 0.0"),
+        (
+            "def total(xs: list[int]) -> int:\n    return sum(xs)",
+            "def total(xs: list[int]) -> int:\n    t = 0\n    for x in xs:\n        t += x\n    return t",
+        ),
+    ],
+    ids=["float-exact", "float-nan-and-signed-zero", "list"],
+)
+def test_pbt_still_passes_an_equivalent_refactor(original: str, modified: str):
+    result = property_based_test_equivalence(original, modified, lang="py", **PBT_FAST)
+    assert result.status_str == "pbt_pass", result.message
+
+
+def test_a_counterexample_of_several_arguments_is_cached_as_a_call(tmp_path: Path):
+    runner, db = _init_then_edit(
+        tmp_path,
+        "# [LOCK: pbt]\ndef add(a: int, b: int) -> int:\n    return a + b\n# [/LOCK]\n",
+        "# [LOCK: pbt]\ndef add(a: int, b: int) -> int:\n    return a - b\n# [/LOCK]\n",
+    )
+    first = runner.invoke(cli, ["check", str(tmp_path)])
+    assert first.exit_code != 0
+    cached = json.loads(db.read_text(encoding="utf-8"))["locks"]["main.py#lock_0"]["cached_counterexamples"]
+    assert cached and cached[0]["function"] == "add" and len(cached[0]["args"]) == 2
+
+    again = runner.invoke(cli, ["check", str(tmp_path)])
+    assert "Instant Regression Detected" in again.output
+
+
+_ENUM = "import enum\nclass Plan(enum.Enum):\n    BASIC = 1\n    PRO = 2\n"
+_POINT = "from dataclasses import dataclass\n@dataclass\nclass Pt:\n    x: int\n    y: int\n"
+_ERROR = "class Bad(Exception):\n    pass\n"
+
+
+@pytest.mark.parametrize(
+    "original, modified, status",
+    [
+        (_ENUM + "def price(p: Plan) -> int:\n    return 10 if p is Plan.BASIC else 30",
+         _ENUM + "def price(p: Plan) -> int:\n    return 30 if p is not Plan.BASIC else 10", "pbt_pass"),
+        (_ENUM + "def price(p: Plan) -> int:\n    return 10 if p is Plan.BASIC else 30",
+         _ENUM + "def price(p: Plan) -> int:\n    return 10 if p is Plan.PRO else 30", "pbt_fail"),
+        (_ENUM + "def plan(x: int) -> Plan:\n    return Plan.PRO if x > 0 else Plan.BASIC",
+         _ENUM + "def plan(x: int) -> Plan:\n    return Plan.BASIC if x <= 0 else Plan.PRO", "pbt_pass"),
+        (_POINT + "def mk(x: int) -> Pt:\n    return Pt(x, x)", _POINT + "def mk(v: int) -> Pt:\n    return Pt(x=v, y=v)", "pbt_pass"),
+        (_POINT + "def mk(x: int) -> Pt:\n    return Pt(x, x)", _POINT + "def mk(x: int) -> Pt:\n    return Pt(x, -x)", "pbt_fail"),
+        (_ERROR + "def f(x: int) -> int:\n    if x < 0:\n        raise Bad()\n    return x",
+         _ERROR + "def f(x: int) -> int:\n    if x >= 0:\n        return x\n    raise Bad()", "pbt_pass"),
+        (_ERROR + "def f(x: int) -> int:\n    if x < 0:\n        raise Bad()\n    return x",
+         _ERROR + "def f(x: int) -> int:\n    if x < 0:\n        raise ValueError()\n    return x", "pbt_fail"),
+    ],
+    ids=["enum-arg-same", "enum-arg-changed", "enum-return-same", "dataclass-same", "dataclass-changed",
+         "own-exception-same", "own-exception-changed"],
+)
+def test_classes_the_region_defines_compare_by_name_and_content(original: str, modified: str, status: str):
+    """Each version of the region is executed on its own, so a class it
+    defines exists twice. Compared by identity, Plan.PRO from the original
+    was never the modified version's Plan.PRO, and every equivalent refactor
+    of code using its own enum, dataclass or exception failed."""
+    result = property_based_test_equivalence(original, modified, lang="py", **PBT_FAST)
+    assert result.status_str == status, result.message

@@ -3,18 +3,21 @@
 import ast
 import copy
 from dataclasses import dataclass, field
+import enum
 import functools
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
-import random
 import re
 import signal
 import subprocess
 import sys
 import textwrap
 from typing import Dict, Any, List, Optional, Set, Tuple
+
+from keepout.inputs import NoStrategy, argument_sets, mine_literals
 
 
 # =====================================================================
@@ -699,50 +702,15 @@ class EquivalenceResult:
 
 
 PBT_LANGS = ("py", "python", "mojo", "🔥")
-EDGE_CASES = [
-    0, 1, -1, 2, -2, 255, 256, 2**16 - 1, 2**16, 2**31 - 1, -2**31,
-    2**32, 2**63 - 1, -2**63, 2**64, 10**9, -10**9,
-]
-# Random inputs in ±1e9 almost never land on a small value, so a boundary
-# such as `x >= 18` -> `x > 18` went unseen. Every small integer is tried.
-SMALL_RANGE = range(-256, 257)
 # A function the original cannot finish on a few inputs is skipped on those;
 # past this many it is too slow to test in this engine at all.
 MAX_ORIGINAL_TIMEOUTS = 5
 _MODULE_CODE = "<module-level code>"
-
-
-def _integer_constants(tree: ast.AST) -> List[int]:
-    """Neighbours of every integer literal, and of integer-looking strings.
-
-    A boundary or a backdoor is usually written as a literal -- `x >= 18`,
-    `x == 123456789` -- and random inputs do not hit it, so each literal c
-    contributes c - 1, c, c + 1 and -c.
-    """
-    found: List[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
-            continue
-        if isinstance(node.value, int):
-            found.append(node.value)
-        elif isinstance(node.value, str) and re.fullmatch(r"[+-]?\d{1,30}", node.value.strip()):
-            found.append(int(node.value))
-    return [n for c in found for n in (c - 1, c, c + 1, -c)]
-
-
-def build_test_inputs(trees: List[ast.AST], num_samples: int, seed: int) -> List[int]:
-    """Edge cases, literal neighbours and small integers, then seeded random
-    integers until there are num_samples. Deterministic for the same code."""
-    inputs: Dict[int, None] = dict.fromkeys(EDGE_CASES)
-    for tree in trees:
-        for value in _integer_constants(tree):
-            inputs.setdefault(value)
-    for value in SMALL_RANGE:
-        inputs.setdefault(value)
-    rng = random.Random(seed)
-    while len(inputs) < num_samples:
-        inputs.setdefault(rng.randint(-10**9, 10**9))
-    return list(inputs)
+# The module names the two versions of a region are executed under. A class
+# the region defines exists once in each, so Plan.PRO from the original is
+# not Plan.PRO of the modified version; values of such classes are compared
+# by name and content, and enum arguments are handed over by name.
+_REGION_MODULES = ("keepout_pbt_original", "keepout_pbt_modified")
 
 
 class _CallTimeout(BaseException):
@@ -754,57 +722,144 @@ def _raise_call_timeout(signum, frame):
     raise _CallTimeout()
 
 
-def _call(func, value, limit: float) -> Tuple[str, Any, str]:
-    """One call, as (kind, value-or-exception-type, detail)."""
+Outcome = Tuple[str, Any, str, Any]  # kind, value or exception type, detail, arguments after
+
+
+def _call(func, args: tuple, kwargs: dict, limit: float) -> Outcome:
+    """One call, as (kind, value-or-exception-type, detail, arguments after).
+
+    Each call gets its own copy of the arguments, so what a function does to
+    them -- appending to a list it was handed -- is compared as well.
+    """
+    args, kwargs = copy.deepcopy(args), copy.deepcopy(kwargs)
     timer = bool(limit) and hasattr(signal, "setitimer")
     try:
         if timer:
             signal.setitimer(signal.ITIMER_REAL, limit)
         try:
-            return ("returned", func(value), "")
+            return ("returned", func(*args, **kwargs), "", (args, kwargs))
         finally:
             if timer:
                 signal.setitimer(signal.ITIMER_REAL, 0)
     except _CallTimeout:
-        return ("timeout", None, "")
+        return ("timeout", None, "", None)
     except KeyboardInterrupt:
         raise
     except BaseException as err:
         # SystemExit too: a region that exits must not end the check.
-        kind = f"{type(err).__module__}.{type(err).__qualname__}"
-        return ("raised", kind, f"{type(err).__name__}: {err}")
+        module = type(err).__module__
+        kind = f"{'<region>' if module in _REGION_MODULES else module}.{type(err).__qualname__}"
+        return ("raised", kind, f"{type(err).__name__}: {err}", (args, kwargs))
 
 
-def _same(a: Tuple[str, Any, str], b: Tuple[str, Any, str]) -> bool:
-    """Same outcome: both returned equal values of the same type, both raised
-    the same exception type, or both ran out of time."""
-    if a[0] != b[0]:
-        return False
-    if a[0] != "returned":
-        return a[1] == b[1]
-    x, y = a[1], b[1]
+def _from_region(cls: type) -> bool:
+    return getattr(cls, "__module__", None) in _REGION_MODULES
+
+
+def _to_modified(value: Any, ns_b: Dict[str, Any]) -> Any:
+    """An argument for the modified version: enum members of a class the
+    region defines become the same-named member of its own class."""
+    if isinstance(value, enum.Enum) and _from_region(type(value)):
+        cls_b = ns_b.get(type(value).__name__)
+        if isinstance(cls_b, type) and issubclass(cls_b, enum.Enum) and value.name in cls_b.__members__:
+            return cls_b[value.name]
+        return value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return type(value)(_to_modified(v, ns_b) for v in value)
+    if isinstance(value, dict):
+        return {_to_modified(k, ns_b): _to_modified(v, ns_b) for k, v in value.items()}
+    return value
+
+
+def _equal(x: Any, y: Any) -> bool:
+    """Equal values of the same type; NaN equals NaN; instances of a class
+    the region defines compare by class name and content."""
     if type(x) is not type(y):
-        return False
+        tx, ty = type(x), type(y)
+        if not (_from_region(tx) and _from_region(ty) and tx.__qualname__ == ty.__qualname__):
+            return False
+        if isinstance(x, enum.Enum):
+            return x.name == y.name and _equal(x.value, y.value)
+        if hasattr(x, "__dict__") and hasattr(y, "__dict__"):
+            return _equal(vars(x), vars(y))
+        try:
+            return repr(x) == repr(y)
+        except Exception:
+            return False
     if isinstance(x, float) and x != x and y != y:
         return True
+    if isinstance(x, (list, tuple)):
+        return len(x) == len(y) and all(_equal(a, b) for a, b in zip(x, y))
+    if isinstance(x, dict):
+        return x.keys() == y.keys() and all(_equal(x[k], y[k]) for k in x)
     try:
-        return bool(x == y)
+        if bool(x == y):
+            return True
+    except Exception:
+        pass
+    try:
+        text = repr(x)
+        return "nan" in text and text == repr(y)
     except Exception:
         return False
 
 
-def _describe(outcome: Tuple[str, Any, str]) -> str:
-    kind, value, detail = outcome
+def _same(a: Outcome, b: Outcome) -> bool:
+    """Same outcome: both returned equal values, or both raised the same
+    exception type, or both ran out of time -- and left their arguments in
+    the same state."""
+    if a[0] != b[0]:
+        return False
+    if a[0] == "timeout":
+        return True
+    if a[0] == "raised" and a[1] != b[1]:
+        return False
+    if a[0] == "returned" and not _equal(a[1], b[1]):
+        return False
+    return _equal(a[3], b[3])
+
+
+def _short(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _describe(outcome: Outcome) -> str:
+    kind, value, detail, _ = outcome
     if kind == "raised":
-        text = f"raises {detail}"
-    elif kind == "timeout":
-        text = "did not finish within the time limit"
-    else:
-        try:
-            text = repr(value)
-        except Exception as err:
-            text = f"<unprintable {type(value).__name__}: {err}>"
-    return text if len(text) <= 200 else text[:197] + "..."
+        return _short(f"raises {detail}")
+    if kind == "timeout":
+        return "did not finish within the time limit"
+    try:
+        return _short(repr(value))
+    except Exception as err:
+        return f"<unprintable {type(value).__name__}: {err}>"
+
+
+def _format_call(name: str, args: tuple, kwargs: dict) -> str:
+    parts = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
+    return _short(f"{name}({', '.join(parts)})", 300)
+
+
+def _cache_entry(name: str, args: tuple, kwargs: dict, single: bool) -> Any:
+    """What keepout.json stores for a counterexample: the bare value for a
+    one-argument function (the format before 0.3.0), otherwise the call."""
+    entry = args[0] if single and len(args) == 1 and not kwargs else {"function": name, "args": list(args), "kwargs": kwargs}
+    try:
+        json.dumps(entry)
+        return entry
+    except (TypeError, ValueError):
+        return None
+
+
+def _cached_calls(cached: List[Any], name: str, single: bool) -> List[Tuple[tuple, dict]]:
+    calls = []
+    for entry in cached:
+        if isinstance(entry, dict) and "args" in entry:
+            if entry.get("function") in (None, name) and isinstance(entry["args"], list):
+                calls.append((tuple(entry["args"]), dict(entry.get("kwargs") or {})))
+        elif single:
+            calls.append(((entry,), {}))
+    return calls
 
 
 def _changed_definitions(tree_a: ast.Module, tree_b: ast.Module) -> Set[str]:
@@ -833,6 +888,12 @@ def _changed_definitions(tree_a: ast.Module, tree_b: ast.Module) -> Set[str]:
 
 def _result(status: str, message: str, counterexample: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"status": status, "message": message, "counterexample": counterexample}
+
+
+def _single_positional(func) -> bool:
+    params = [p for p in inspect.signature(func).parameters.values()
+              if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
+    return len(params) == 1 and params[0].kind != params[0].KEYWORD_ONLY
 
 
 def _compare_regions(
@@ -882,23 +943,34 @@ def _compare_regions(
             "Use [LOCK: ast] or [LOCK: strict] for it."
         ))
 
-    generated = build_test_inputs([tree_a, tree_b], num_samples, seed)
-    returned = {name: 0 for name in names}
+    # Arguments come from each parameter's type hint (int where there is
+    # none). Until 0.3.0 every function got exactly one int, so a function of
+    # two arguments, or of a string, raised TypeError on every call.
+    literals = mine_literals([tree_a, tree_b])
+    plans: Dict[str, Tuple[List[Tuple[tuple, dict]], bool]] = {}
     first_error: Dict[str, str] = {}
+    for name in names:
+        func_a, func_b = ns_a.get(name), ns_b.get(name)
+        if not callable(func_a):
+            continue
+        if not callable(func_b):
+            return _result("pbt_fail", f"🚨 `{name}` is no longer defined as a function by the modified region.")
+        try:
+            plans[name] = (argument_sets(func_a, ns_a, literals, num_samples, seed), _single_positional(func_a))
+        except NoStrategy as err:
+            first_error[name] = f"no input generator for parameter {err}"
+        except (TypeError, ValueError) as err:
+            first_error[name] = f"its signature cannot be read: {err}"
+
+    returned = {name: 0 for name in names}
     compared = 0
     original_timeouts = 0
-
-    for phase, values in (("cached", list(cached_counterexamples)), ("generated", generated)):
-        for name in names:
-            func_a, func_b = ns_a.get(name), ns_b.get(name)
-            if not callable(func_a):
-                continue
-            if not callable(func_b):
-                return _result("pbt_fail", (
-                    f"🚨 `{name}` is no longer defined as a function by the modified region."
-                ))
-            for value in values:
-                out_a = _call(func_a, value, per_call_timeout)
+    for phase in ("cached", "generated"):
+        for name, (generated, single) in plans.items():
+            func_a, func_b = ns_a[name], ns_b[name]
+            calls = _cached_calls(cached_counterexamples, name, single) if phase == "cached" else generated
+            for args, kwargs in calls:
+                out_a = _call(func_a, args, kwargs, per_call_timeout)
                 if out_a[0] == "timeout":
                     original_timeouts += 1
                     if original_timeouts > MAX_ORIGINAL_TIMEOUTS:
@@ -908,44 +980,52 @@ def _compare_regions(
                             f"for this engine. Use [LOCK: ast] for it."
                         ))
                     continue
-                out_b = _call(func_b, value, per_call_timeout)
+                out_b = _call(func_b, _to_modified(args, ns_b), _to_modified(kwargs, ns_b), per_call_timeout)
                 compared += 1
                 if out_a[0] == "returned":
                     returned[name] += 1
                 elif name not in first_error:
                     first_error[name] = out_a[2]
-                if not _same(out_a, out_b):
-                    expected, actual = _describe(out_a), _describe(out_b)
-                    headline = (
-                        "🚨 Instant Regression Detected (Cached Counterexample)! Mismatch found:\n"
-                        f"  Function: {name}\n  Cached Input: {value!r}\n"
-                        if phase == "cached" else
-                        "🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:\n"
-                        f"  Function: {name}\n  Input Parameter: {value!r}\n"
-                    )
-                    return _result("pbt_fail", (
-                        headline
-                        + f"  Expected Output (Original): {expected}\n"
-                        + f"  Actual Output (Modified): {actual}"
-                    ), {"function": name, "input": value, "output_a": expected, "output_b": actual})
+                if _same(out_a, out_b):
+                    continue
+                expected, actual = _describe(out_a), _describe(out_b)
+                call = _format_call(name, args, kwargs)
+                lines = [
+                    "🚨 Instant Regression Detected (Cached Counterexample)! Mismatch found:"
+                    if phase == "cached" else
+                    "🚨 Logic Mismatch Detected (Deterministic PBT)! Counterexample found:",
+                    f"  Function: {name}",
+                    (f"  {'Cached Input' if phase == 'cached' else 'Input Parameter'}: {args[0]!r}"
+                     if single and len(args) == 1 and not kwargs else f"  Call: {call}"),
+                    f"  Expected Output (Original): {expected}",
+                    f"  Actual Output (Modified): {actual}",
+                ]
+                if out_a[0] == out_b[0] != "timeout" and expected == actual:
+                    lines.append(f"  Arguments after the call (Original): {_short(repr(out_a[3]))}")
+                    lines.append(f"  Arguments after the call (Modified): {_short(repr(out_b[3]))}")
+                return _result("pbt_fail", "\n".join(lines), {
+                    "function": name,
+                    "input": _cache_entry(name, args, kwargs, single),
+                    "output_a": expected,
+                    "output_b": actual,
+                })
 
-    # A function the original never returned from was never really observed:
-    # every call raised (one integer argument is all this engine passes).
+    # A function the original never returned from was never really observed.
     # That is only acceptable when nothing it depends on in the region changed.
     changed = _changed_definitions(tree_a, tree_b)
     never_returned = [name for name in names if returned[name] == 0 and callable(ns_a.get(name))]
     unverified = [name for name in never_returned if name in changed or _MODULE_CODE in changed]
     if unverified:
         details = "\n".join(
-            f"  `{name}`: first error {first_error.get(name, 'none recorded')}" for name in unverified
+            f"  `{name}`: {first_error.get(name, 'no call returned')}" for name in unverified
         )
         return _result("pbt_unverifiable", (
-            f"🔍 Nothing was verified for {', '.join(f'`{n}`' for n in unverified)}: the original "
-            f"raised on every one of {len(generated)} generated inputs, so the two versions were "
-            f"never compared on a returned value.\n{details}\n"
-            f"  This engine calls each top-level function with ONE INTEGER argument. A function "
-            f"taking several arguments, or other types, cannot be reached -- use [LOCK: ast] for "
-            f"it, or hold its behaviour in a test written for its real signature.\n"
+            f"🔍 Nothing was verified for {', '.join(f'`{n}`' for n in unverified)}: no generated call "
+            f"to the original returned, so the two versions were never compared on a result.\n{details}\n"
+            f"  Arguments are generated from each parameter's type hint (int where there is none): "
+            f"int, float, bool, str, bytes, None, Optional/Union, Literal, Enum, Decimal, date, "
+            f"datetime, and list/tuple/set/dict of those. Annotate the parameters, or use "
+            f"[LOCK: ast] for a function these cannot reach.\n"
             f"  Reporting a pass here would be worse than having no lock: an absent check is "
             f"visible and a check that cannot fail is not."
         ))
@@ -954,8 +1034,8 @@ def _compare_regions(
     skipped = [name for name in never_returned if name not in unverified]
     note = f" Not callable here but unchanged: {', '.join(skipped)}." if skipped else ""
     return _result("pbt_pass", (
-        f"✨ Passed Deterministic PBT: {', '.join(verified)} matched on {len(generated)} "
-        f"reproducible inputs (seed={seed}; {compared} calls compared, exceptions included).{note}"
+        f"✨ Passed Deterministic PBT: {', '.join(verified)} matched on {compared} reproducible calls "
+        f"(seed={seed}); return values, exceptions and changes to the arguments compared.{note}"
     ))
 
 

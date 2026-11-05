@@ -21,7 +21,7 @@ KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renami
 | Engine | Syntax Directive | How It Works | Cost | Ideal Use Case |
 | :--- | :--- | :--- | :--- | :--- |
 | **Smart Syntax Lock** *(Default)* | `# [LOCK]` or `# [LOCK: ast]` | **AST Alpha-Renaming & Structural Hash**. Ignores comments, whitespace, formatting, and renames of parameters and local variables (`x` ➔ `val`). Names visible outside the function — callees, builtins, globals, and the functions, classes and constants the region defines — must stay as written. Renames are recognised in Python only; other languages get a token hash that ignores comments and formatting. | Linear in region size (about 7 ms per 100 lines of Python) | Formatting & linting-heavy codebases where code structure must stay intact. |
-| **Deterministic PBT Sub-Engine** | `# [LOCK: pbt]` or `# [LOCK: logic]` | Calls **every top-level function** in the region with the same 10,000+ integers, in the original and the edited version, and compares return values *and* raised exceptions. Python and Mojo only. | About 0.2–0.5 s per edited region (a separate Python process); at most 1 s per call and 60 s per region | Pure functions of **one integer argument** whose implementation may be refactored. |
+| **Deterministic PBT Sub-Engine** | `# [LOCK: pbt]` or `# [LOCK: logic]` | Calls **every top-level function** in the region with the same 10,000 reproducible argument sets, generated from each parameter's type hint, in the original and the edited version, and compares return values, raised exceptions and changes to the arguments. Python and Mojo only. | About 0.2–0.5 s per edited region (a separate Python process); at most 1 s per call and 60 s per region | Pure functions of numbers, strings, bools, dates, enums or containers of them, whose implementation may be refactored. |
 | **Strict Lock** | `# [LOCK: strict]` | SHA-256 exact byte hash matching. Rejects any edit including spaces or comments. | Linear in region size | Security constants, preventing re-occurrence of critical bugs. |
 
 ---
@@ -39,19 +39,21 @@ KeepOut features **Smart Syntax Locking** (AST structural hash with alpha-renami
                                                    │
                                                    ├── Fail? ➔ Instant Regression Block 🚨
                                                    └── Pass? ➔ [ 2. Deterministic PBT Engine ]
-                                                               (edge cases, every integer in -256..256,
-                                                                c-1/c/c+1/-c for each literal c in the code,
-                                                                random integers up to 10,000 inputs, seed=42)
+                                                               (arguments from each parameter's type hint:
+                                                                edge cases, literals in the code and their
+                                                                neighbours, then seeded random values,
+                                                                10,000 calls per function, seed=42)
                                                                        │
-                                                                       ├── Same results & exceptions ➔ PASS ✨
+                                                                       ├── Same results, exceptions & argument changes ➔ PASS ✨
                                                                        ├── Discrepancy ➔ BLOCK 🚨 (Auto-cache Counterexample)
                                                                        └── Nothing could be compared ➔ UNVERIFIABLE 🔍 (fails the check)
 ```
 
 1. **Deterministic Inputs (No Flaky Tests)**: The inputs depend only on the seed and on the code, so local and CI runs test the same values.
-2. **Boundaries from the code**: Each integer literal in either version contributes its neighbours, so `x >= 18` ➔ `x > 18` or a special case for `x == 123456789` is caught. Values the code does not mention, outside -256..256, are only sampled at random.
-3. **Counterexample Caching**: When a mismatch is caught, KeepOut stores the failing input in `keepout.json` (so `check` writes to that file) and tries it first on later checks.
-4. **UNVERIFIABLE is a failure**: A function the engine cannot call — several arguments, non-integer input, names defined outside the region — is reported as verifying nothing rather than passing. Use an ast or strict lock for it.
+2. **Arguments from the signature**: Each parameter gets values for its type hint — `int` (also the default for an unannotated parameter), `float` (including ±0.0, ±inf and NaN), `bool`, `str`, `bytes`, `None`, `Optional`/`Union`, `Literal`, `Enum`, `Decimal`, `date`, `datetime`, and `list`/`tuple`/`set`/`dict` of those. Every value of every parameter is tried with the others held at a typical value, then seeded random combinations fill the 10,000 calls.
+3. **Boundaries from the code**: Each literal in either version contributes its neighbours — an integer c gives c-1, c, c+1 and -c, a string gives its upper/lower/padded variants — so `x >= 18` ➔ `x > 18`, `code == "VIP"` ➔ `code == "vip"` or a special case for `x == 123456789` is caught. Values the code does not mention, outside -256..256, are only sampled at random.
+4. **Counterexample Caching**: When a mismatch is caught, KeepOut stores the failing input (or, for several arguments, the call) in `keepout.json` (so `check` writes to that file) and tries it first on later checks.
+5. **UNVERIFIABLE is a failure**: A function the engine cannot call — a parameter of a type with no generator (your own classes), or names defined outside the region — is reported as verifying nothing rather than passing. Use an ast or strict lock for it.
 
 ---
 
@@ -169,7 +171,7 @@ Make the job a required check, and put locked files and `keepout.json` under `CO
 
 - **Without `--base`, anyone who can write to the repository can re-lock.** `keepout init` records whatever the code is now, and plain `keepout check` trusts that record. Use `--base` in CI and the hook; it compares with git instead. Even then KeepOut fails a check — it cannot stop someone who can merge without it, or who deletes the CI job. Make the check required and review `keepout.json` and locked files through `CODEOWNERS`.
 - **Code outside the region.** Redefining a locked function later in the file, or monkeypatching it elsewhere, does not touch the region.
-- **PBT only sees what it can call.** Each top-level function is called with one integer. Behaviour for other inputs (floats, strings, large values the code never mentions) is not tested.
+- **PBT only sees what it can call.** Methods, functions taking your own classes, and values the generators do not produce (huge or deeply nested inputs, values the code never mentions) are not tested.
 - **Renames outside Python.** For other languages the ast lock compares tokens: comments and formatting are ignored, renaming a variable is a change.
 - **`keepout.json` from an older keepout.** A database written with a different hash format is refused; review the regions and run `keepout init`.
 
